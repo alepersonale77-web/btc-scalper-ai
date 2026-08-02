@@ -40,7 +40,7 @@ async def main():
                 f"{now} | BTCUSDT M15 | "
                 f"Open: {open_price} | "
                 f"Close: {close_price} | "
-                f"Movimento: {direction}"
+                f"Movimento: {direction}",
                 flush=True
             )
 
