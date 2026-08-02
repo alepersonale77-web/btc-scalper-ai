@@ -14,10 +14,10 @@ async def get_btc_price():
     )
 
     async with session.get(url) as response:
-    data = await response.json()
+        data = await response.json()
 
-    if not isinstance(data, list):
-        raise Exception(f"Risposta Binance non valida: {data}")
+        if not isinstance(data, list):
+            raise Exception(f"Risposta Binance non valida: {data}")
 
     last_candle = data[-1]
 
