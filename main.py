@@ -26,7 +26,7 @@ async def get_btc_price():
 
 
 async def main():
-    printprint("🚀 BTC Scalper AI avviato", flush=True)
+    print("🚀 BTC Scalper AI avviato", flush=True)
 
     while True:
         try:
