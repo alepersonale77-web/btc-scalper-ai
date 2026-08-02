@@ -5,17 +5,18 @@ from telegram import Bot
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-async def send_test():
+
+async def main():
     bot = Bot(token=TOKEN)
-    
-    await bot.send_message(
-        chat_id=CHAT_ID,
-        text=(
-            "🚨 BTC Scalper AI TEST\n\n"
-            "✅ Collegamento Telegram riuscito\n"
-            "📊 Sistema pronto per sviluppo segnali BTCUSD\n"
-        )
-    )
+
+    print("🚀 BTC Scalper AI avviato")
+
+    while True:
+        # Qui inseriremo il motore segnali BTCUSD
+        # Per ora il bot resta acceso senza inviare messaggi
+
+        await asyncio.sleep(60)
+
 
 if __name__ == "__main__":
-    asyncio.run(send_test())
+    asyncio.run(main())
