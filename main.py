@@ -13,9 +13,11 @@ async def get_btc_price():
         f"?symbol={SYMBOL}&interval={INTERVAL}&limit=3"
     )
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            data = await response.json()
+    async with session.get(url) as response:
+    data = await response.json()
+
+    if not isinstance(data, list):
+        raise Exception(f"Risposta Binance non valida: {data}")
 
     last_candle = data[-1]
 
