@@ -9,10 +9,23 @@ INTERVAL = "15m"
 
 async def get_btc_price():
     url = (
-        "https://api.binance.com/api/v3/klines"
-        f"?symbol={SYMBOL}&interval={INTERVAL}&limit=3"
+        "https://api.exchange.coinbase.com/products/"
+        "BTC-USD/candles?granularity=900"
     )
 
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            data = await response.json()
+
+    if not isinstance(data, list):
+        raise Exception(f"Risposta Coinbase non valida: {data}")
+
+    last_candle = data[0]
+
+    open_price = float(last_candle[3])
+    close_price = float(last_candle[4])
+
+    return open_price, close_price
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as response:
             data = await response.json()
