@@ -26,7 +26,7 @@ async def get_btc_price():
 
 
 async def main():
-    print("🚀 BTC Scalper AI avviato")
+    printprint("🚀 BTC Scalper AI avviato", flush=True)
 
     while True:
         try:
@@ -41,6 +41,7 @@ async def main():
                 f"Open: {open_price} | "
                 f"Close: {close_price} | "
                 f"Movimento: {direction}"
+                flush=True
             )
 
         except Exception as e:
