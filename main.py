@@ -1,19 +1,50 @@
-import os
 import asyncio
-from telegram import Bot
+import aiohttp
+from datetime import datetime
 
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+SYMBOL = "BTCUSDT"
+INTERVAL = "15m"
+
+
+async def get_btc_price():
+    url = (
+        "https://api.binance.com/api/v3/klines"
+        f"?symbol={SYMBOL}&interval={INTERVAL}&limit=3"
+    )
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            data = await response.json()
+
+    last_candle = data[-1]
+
+    open_price = float(last_candle[1])
+    close_price = float(last_candle[4])
+
+    return open_price, close_price
 
 
 async def main():
-    bot = Bot(token=TOKEN)
-
     print("🚀 BTC Scalper AI avviato")
 
     while True:
-        # Qui inseriremo il motore segnali BTCUSD
-        # Per ora il bot resta acceso senza inviare messaggi
+        try:
+            open_price, close_price = await get_btc_price()
+
+            now = datetime.now().strftime("%H:%M:%S")
+
+            direction = "RIALZO" if close_price > open_price else "RIBASSO"
+
+            print(
+                f"{now} | BTCUSDT M15 | "
+                f"Open: {open_price} | "
+                f"Close: {close_price} | "
+                f"Movimento: {direction}"
+            )
+
+        except Exception as e:
+            print("Errore:", e)
 
         await asyncio.sleep(60)
 
