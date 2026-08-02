@@ -45,7 +45,7 @@ async def main():
             )
 
         except Exception as e:
-            print("Errore:", e)
+    print("Errore Binance:", repr(e), flush=True)
 
         await asyncio.sleep(60)
 
