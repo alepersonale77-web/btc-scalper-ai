@@ -6,11 +6,11 @@ from datetime import datetime
 PRODUCT = "BTC-USD"
 
 
-async def get_candle(granularity):
+async def get_candles(granularity, limit=5):
 
     url = (
         f"https://api.exchange.coinbase.com/products/"
-        f"{PRODUCT}/candles?granularity={granularity}"
+        f"{PRODUCT}/candles?granularity={granularity}&limit={limit}"
     )
 
     async with aiohttp.ClientSession() as session:
@@ -20,15 +20,10 @@ async def get_candle(granularity):
     if not isinstance(data, list):
         raise Exception(f"Risposta Coinbase non valida: {data}")
 
-    candle = data[0]
-
-    open_price = float(candle[3])
-    close_price = float(candle[4])
-
-    return open_price, close_price
+    return data
 
 
-def direction(open_price, close_price):
+def candle_direction(open_price, close_price):
 
     if close_price > open_price:
         return "RIALZO"
@@ -43,22 +38,26 @@ async def main():
     while True:
 
         try:
-            # H4
-            h4_open, h4_close = await get_candle(14400)
+            # H1 - usiamo 4 candele per costruire H4
+            h1_candles = await get_candles(3600, 5)
+
+            h4_open = float(h1_candles[3][3])
+            h4_close = float(h1_candles[0][4])
 
             # H1
-            h1_open, h1_close = await get_candle(3600)
+            h1_open = float(h1_candles[1][3])
+            h1_close = float(h1_candles[1][4])
 
             # M15
-            m15_open, m15_close = await get_candle(900)
+            m15_candles = await get_candles(900, 2)
+
+            m15_open = float(m15_candles[0][3])
+            m15_close = float(m15_candles[0][4])
 
 
-            h4 = direction(h4_open, h4_close)
-            h1 = direction(h1_open, h1_close)
-            m15 = direction(m15_open, m15_close)
-
-
-            now = datetime.now().strftime("%H:%M:%S")
+            h4 = candle_direction(h4_open, h4_close)
+            h1 = candle_direction(h1_open, h1_close)
+            m15 = candle_direction(m15_open, m15_close)
 
 
             stato = (
@@ -66,6 +65,9 @@ async def main():
                 if h4 == h1 == m15
                 else "IN ATTESA"
             )
+
+
+            now = datetime.now().strftime("%H:%M:%S")
 
 
             print(
