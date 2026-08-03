@@ -44,8 +44,8 @@ async def get_btc_price():
 async def main():
   print("🚀 BTC Trend AI avviato", flush=True) 
 
-    while True:
-        try:
+while True:
+    try:
             open_price, close_price = await get_btc_price()
 
             now = datetime.now().strftime("%H:%M:%S")
@@ -60,10 +60,10 @@ async def main():
                 flush=True
             )
 
-        except Exception as e:
+     except Exception as e:
             print("Errore Binance:", repr(e), flush=True)
 
-        await asyncio.sleep(60)
+     await asyncio.sleep(60)
 
 
 if __name__ == "__main__":
