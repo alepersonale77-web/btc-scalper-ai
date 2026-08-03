@@ -42,7 +42,7 @@ async def get_btc_price():
 
 
 async def main():
-    print("🚀 BTC Scalper AI avviato", flush=True)
+  print("🚀 BTC Trend AI avviato", flush=True) 
 
     while True:
         try:
