@@ -3,14 +3,14 @@ import aiohttp
 from datetime import datetime
 
 
-SYMBOL = "BTCUSD"
-INTERVAL = "15m"
+PRODUCT = "BTC-USD"
 
 
-async def get_btc_price():
+async def get_candle(granularity):
+
     url = (
-        "https://api.exchange.coinbase.com/products/"
-        "BTC-USD/candles?granularity=900"
+        f"https://api.exchange.coinbase.com/products/"
+        f"{PRODUCT}/candles?granularity={granularity}"
     )
 
     async with aiohttp.ClientSession() as session:
@@ -20,12 +20,20 @@ async def get_btc_price():
     if not isinstance(data, list):
         raise Exception(f"Risposta Coinbase non valida: {data}")
 
-    last_candle = data[0]
+    candle = data[0]
 
-    open_price = float(last_candle[3])
-    close_price = float(last_candle[4])
+    open_price = float(candle[3])
+    close_price = float(candle[4])
 
     return open_price, close_price
+
+
+def direction(open_price, close_price):
+
+    if close_price > open_price:
+        return "RIALZO"
+    else:
+        return "RIBASSO"
 
 
 async def main():
@@ -33,27 +41,46 @@ async def main():
     print("🚀 BTC Trend AI avviato", flush=True)
 
     while True:
+
         try:
-            open_price, close_price = await get_btc_price()
+            # H4
+            h4_open, h4_close = await get_candle(14400)
+
+            # H1
+            h1_open, h1_close = await get_candle(3600)
+
+            # M15
+            m15_open, m15_close = await get_candle(900)
+
+
+            h4 = direction(h4_open, h4_close)
+            h1 = direction(h1_open, h1_close)
+            m15 = direction(m15_open, m15_close)
+
 
             now = datetime.now().strftime("%H:%M:%S")
 
-            direction = (
-                "RIALZO"
-                if close_price > open_price
-                else "RIBASSO"
+
+            stato = (
+                "TREND ALLINEATO"
+                if h4 == h1 == m15
+                else "IN ATTESA"
             )
 
+
             print(
-                f"{now} | BTCUSD M15 | "
-                f"Open: {open_price} | "
-                f"Close: {close_price} | "
-                f"Movimento: {direction}",
+                f"\n{now} | BTC Trend AI\n"
+                f"H4: {h4}\n"
+                f"H1: {h1}\n"
+                f"M15: {m15}\n"
+                f"Stato: {stato}",
                 flush=True
             )
 
+
         except Exception as e:
-            print("Errore Coinbase:", repr(e), flush=True)
+            print("Errore:", repr(e), flush=True)
+
 
         await asyncio.sleep(60)
 
