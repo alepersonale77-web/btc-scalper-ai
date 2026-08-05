@@ -10,7 +10,7 @@ async def get_candles(granularity, limit=5):
 
     url = (
         f"https://api.exchange.coinbase.com/products/"
-        f"{PRODUCT}/candles?granularity={granularity}&limit={limit}"
+        f"{PRODUCT}/candles?granularity={granularity}"
     )
 
     async with aiohttp.ClientSession() as session:
@@ -20,52 +20,88 @@ async def get_candles(granularity, limit=5):
     if not isinstance(data, list):
         raise Exception(f"Risposta Coinbase non valida: {data}")
 
+    # Coinbase manda le candele dalla più recente alla più vecchia
+    data = data[:limit]
+
+    # Ordiniamo dalla più vecchia alla più recente
+    data.reverse()
+
     return data
 
 
-def candle_direction(open_price, close_price):
+def analyze_trend(candles):
 
-    if close_price > open_price:
-        return "RIALZO"
-    else:
-        return "RIBASSO"
+    bullish = 0
+    bearish = 0
+
+    for candle in candles:
+        open_price = float(candle[3])
+        close_price = float(candle[4])
+
+        if close_price > open_price:
+            bullish += 1
+        else:
+            bearish += 1
+
+    total = len(candles)
+
+    if bullish >= total - 1:
+        return f"RIALZO FORTE ({bullish}/{total})"
+
+    if bearish >= total - 1:
+        return f"RIBASSO FORTE ({bearish}/{total})"
+
+    if bullish > bearish:
+        return f"RIALZO ({bullish}/{total})"
+
+    if bearish > bullish:
+        return f"RIBASSO ({bearish}/{total})"
+
+    return f"INCERTO ({bullish}/{total})"
+
+
+def get_state(h4, h1, m15):
+
+    if "RIALZO" in h4 and "RIALZO" in h1:
+        if "RIBASSO" in m15:
+            return "PULLBACK RIALZISTA"
+
+        return "TREND RIALZISTA"
+
+    if "RIBASSO" in h4 and "RIBASSO" in h1:
+        if "RIALZO" in m15:
+            return "PULLBACK RIBASSISTA"
+
+        return "TREND RIBASSISTA"
+
+    return "ATTESA"
 
 
 async def main():
 
-    print("🚀 BTC Trend AI v0.3 avviato", flush=True)  
+    print("🚀 BTC Trend AI v0.3.1 avviato", flush=True)
 
     while True:
 
         try:
-            # H1 - usiamo 4 candele per costruire H4
+
+            # H4 costruito da 5 candele H1
             h1_candles = await get_candles(3600, 5)
 
-            h4_open = float(h1_candles[3][3])
-            h4_close = float(h1_candles[0][4])
+            h4 = analyze_trend(h1_candles)
 
             # H1
-            h1_open = float(h1_candles[1][3])
-            h1_close = float(h1_candles[1][4])
+            h1_candles = await get_candles(3600, 5)
+
+            h1 = analyze_trend(h1_candles)
 
             # M15
-            m15_candles = await get_candles(900, 2)
+            m15_candles = await get_candles(900, 5)
 
-            m15_open = float(m15_candles[0][3])
-            m15_close = float(m15_candles[0][4])
-
-
-            h4 = candle_direction(h4_open, h4_close)
-            h1 = candle_direction(h1_open, h1_close)
-            m15 = candle_direction(m15_open, m15_close)
+            m15 = analyze_trend(m15_candles)
 
 
-            stato = (
-                "TREND ALLINEATO"
-                if h4 == h1 == m15
-                else "IN ATTESA"
-            )
-
+            stato = get_state(h4, h1, m15)
 
             now = datetime.now().strftime("%H:%M:%S")
 
