@@ -1,7 +1,6 @@
 import asyncio
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Any
 
 import aiohttp
 from telegram import Bot
@@ -23,7 +22,9 @@ COINBASE_URL = (
     f"{PRODUCT}/candles"
 )
 
-last_alert_key: str | None = None
+# Memoria semplice in RAM:
+# evita notifiche ripetute finche' lo stato non cambia.
+last_notified_state: str | None = None
 
 
 def floor_time(value: datetime, seconds: int) -> datetime:
@@ -50,7 +51,9 @@ async def fetch_candles(
     while len(candles_by_time) < required_count:
         missing = required_count - len(candles_by_time)
         chunk_size = min(300, missing + 5)
-        start_time = end_time - timedelta(seconds=granularity * chunk_size)
+        start_time = end_time - timedelta(
+            seconds=granularity * chunk_size
+        )
 
         params = {
             "granularity": str(granularity),
@@ -71,10 +74,14 @@ async def fetch_candles(
                 )
 
         if not isinstance(data, list):
-            raise RuntimeError(f"Risposta Coinbase non valida: {data}")
+            raise RuntimeError(
+                f"Risposta Coinbase non valida: {data}"
+            )
 
         for candle in data:
             candle_time = int(candle[0])
+
+            # Usa soltanto candele chiuse.
             if candle_time < int(final_boundary.timestamp()):
                 candles_by_time[candle_time] = candle
 
@@ -125,7 +132,14 @@ def aggregate_h1_to_h4(
         volume = sum(float(candle[5]) for candle in group)
 
         h4_candles.append(
-            [bucket, low_price, high_price, open_price, close_price, volume]
+            [
+                bucket,
+                low_price,
+                high_price,
+                open_price,
+                close_price,
+                volume,
+            ]
         )
 
     return h4_candles
@@ -133,18 +147,26 @@ def aggregate_h1_to_h4(
 
 def calculate_ema(values: list[float], period: int) -> float:
     if len(values) < period:
-        raise ValueError(f"Servono almeno {period} valori per EMA{period}")
+        raise ValueError(
+            f"Servono almeno {period} valori per EMA{period}"
+        )
 
     multiplier = 2 / (period + 1)
     ema_value = sum(values[:period]) / period
 
     for value in values[period:]:
-        ema_value = value * multiplier + ema_value * (1 - multiplier)
+        ema_value = (
+            value * multiplier
+            + ema_value * (1 - multiplier)
+        )
 
     return ema_value
 
 
-def calculate_rsi(values: list[float], period: int = 14) -> float:
+def calculate_rsi(
+    values: list[float],
+    period: int = 14,
+) -> float:
     if len(values) < period + 1:
         raise ValueError(
             f"Servono almeno {period + 1} valori per RSI{period}"
@@ -162,8 +184,12 @@ def calculate_rsi(values: list[float], period: int = 14) -> float:
     average_loss = sum(losses[:period]) / period
 
     for gain, loss in zip(gains[period:], losses[period:]):
-        average_gain = ((average_gain * (period - 1)) + gain) / period
-        average_loss = ((average_loss * (period - 1)) + loss) / period
+        average_gain = (
+            (average_gain * (period - 1)) + gain
+        ) / period
+        average_loss = (
+            (average_loss * (period - 1)) + loss
+        ) / period
 
     if average_loss == 0:
         return 100.0
@@ -198,7 +224,9 @@ def calculate_atr(
     atr_value = sum(true_ranges[:period]) / period
 
     for true_range in true_ranges[period:]:
-        atr_value = ((atr_value * (period - 1)) + true_range) / period
+        atr_value = (
+            (atr_value * (period - 1)) + true_range
+        ) / period
 
     return atr_value
 
@@ -214,7 +242,14 @@ def analyze_timeframe(
     ema200 = calculate_ema(closes, EMA_SLOW_PERIOD)
     rsi = calculate_rsi(closes, RSI_PERIOD)
     atr = calculate_atr(candles, ATR_PERIOD)
+
+    ema_distance_percent = (
+        abs(ema50 - ema200) / ema200
+    ) * 100
     atr_percent = (atr / price) * 100
+    price_vs_ema50_percent = (
+        (price - ema50) / ema50
+    ) * 100
 
     if ema50 > ema200 and price > ema50:
         trend = "RIALZISTA"
@@ -223,14 +258,13 @@ def analyze_timeframe(
     else:
         trend = "NEUTRO / LATERALE"
 
-    ema_distance_percent = abs(ema50 - ema200) / ema200 * 100
-
     return {
         "timeframe": timeframe,
         "price": price,
         "ema50": ema50,
         "ema200": ema200,
         "ema_distance": ema_distance_percent,
+        "price_vs_ema50": price_vs_ema50_percent,
         "rsi": rsi,
         "atr": atr,
         "atr_percent": atr_percent,
@@ -238,96 +272,206 @@ def analyze_timeframe(
     }
 
 
-def determine_direction(
-    h4: dict[str, float | str],
-    h1: dict[str, float | str],
-) -> str:
-    if h4["trend"] == "RIALZISTA" and h1["trend"] == "RIALZISTA":
-        return "BUY"
-    if h4["trend"] == "RIBASSISTA" and h1["trend"] == "RIBASSISTA":
-        return "SELL"
-    return "NONE"
-
-
-def calculate_setup_score(
+def score_direction(
     direction: str,
     h4: dict[str, float | str],
     h1: dict[str, float | str],
     m15: dict[str, float | str],
 ) -> tuple[int, list[str]]:
-    if direction == "NONE":
-        return 0, ["H4 e H1 non sono allineati"]
+    expected = "RIALZISTA" if direction == "BUY" else "RIBASSISTA"
+    opposite = "RIBASSISTA" if direction == "BUY" else "RIALZISTA"
 
     score = 0
     reasons: list[str] = []
-    expected_trend = "RIALZISTA" if direction == "BUY" else "RIBASSISTA"
 
-    if h4["trend"] == expected_trend:
+    # H4: massimo 30.
+    if h4["trend"] == expected:
         score += 22
-        reasons.append(f"H4 {expected_trend.lower()}")
-        if float(h4["ema_distance"]) >= 0.30:
-            score += 8
-            reasons.append("H4 con buona separazione EMA")
-
-    if h1["trend"] == expected_trend:
-        score += 18
-        reasons.append(f"H1 {expected_trend.lower()}")
-        if float(h1["ema_distance"]) >= 0.20:
-            score += 7
-            reasons.append("H1 con buona separazione EMA")
-
-    if m15["trend"] == expected_trend:
-        score += 20
-        reasons.append("M15 allineato al trend")
-    elif m15["trend"] == "NEUTRO / LATERALE":
+        reasons.append(f"H4 {expected.lower()}")
+    elif h4["trend"] == "NEUTRO / LATERALE":
         score += 8
-        reasons.append("M15 in attesa di conferma")
+        reasons.append("H4 neutro")
     else:
-        reasons.append("M15 ancora in pullback")
+        reasons.append(f"H4 {opposite.lower()}")
 
+    if h4["trend"] == expected:
+        distance = float(h4["ema_distance"])
+        if distance >= 0.40:
+            score += 8
+            reasons.append("H4 con EMA ben separate")
+        elif distance >= 0.20:
+            score += 4
+            reasons.append("H4 con EMA moderatamente separate")
+
+    # H1: massimo 25.
+    if h1["trend"] == expected:
+        score += 18
+        reasons.append(f"H1 {expected.lower()}")
+    elif h1["trend"] == "NEUTRO / LATERALE":
+        score += 8
+        reasons.append("H1 quasi in attesa")
+    else:
+        reasons.append(f"H1 {opposite.lower()}")
+
+    if h1["trend"] == expected:
+        distance = float(h1["ema_distance"])
+        if distance >= 0.30:
+            score += 7
+            reasons.append("H1 con EMA ben separate")
+        elif distance >= 0.15:
+            score += 3
+            reasons.append("H1 con EMA moderatamente separate")
+
+    # M15: massimo 20.
+    if m15["trend"] == expected:
+        score += 20
+        reasons.append("M15 allineato")
+    elif m15["trend"] == "NEUTRO / LATERALE":
+        score += 10
+        reasons.append("M15 neutro: attesa conferma")
+    else:
+        score += 4
+        reasons.append("M15 in pullback")
+
+    # RSI: massimo 15.
     h1_rsi = float(h1["rsi"])
     m15_rsi = float(m15["rsi"])
 
     if direction == "BUY":
-        if 50 <= h1_rsi <= 68:
+        if 48 <= h1_rsi <= 68:
             score += 8
             reasons.append("RSI H1 favorevole")
-        if 50 <= m15_rsi <= 70:
+        if 48 <= m15_rsi <= 70:
             score += 7
             reasons.append("RSI M15 favorevole")
     else:
-        if 32 <= h1_rsi <= 50:
+        if 32 <= h1_rsi <= 52:
             score += 8
             reasons.append("RSI H1 favorevole")
-        if 30 <= m15_rsi <= 50:
+        if 30 <= m15_rsi <= 52:
             score += 7
             reasons.append("RSI M15 favorevole")
 
+    # Volatilita': massimo 10.
     atr_percent = float(h1["atr_percent"])
 
     if atr_percent >= 0.80:
         score += 10
-        reasons.append("VolatilitÃ  H1 elevata")
+        reasons.append("Volatilita' H1 elevata")
     elif atr_percent >= 0.45:
         score += 7
-        reasons.append("VolatilitÃ  H1 sufficiente")
+        reasons.append("Volatilita' H1 sufficiente")
     elif atr_percent >= 0.25:
         score += 3
-        reasons.append("VolatilitÃ  H1 modesta")
+        reasons.append("Volatilita' H1 modesta")
     else:
-        reasons.append("VolatilitÃ  H1 troppo bassa")
+        reasons.append("Volatilita' H1 bassa")
 
     return min(score, 100), reasons
 
 
-def traffic_light(score: int, direction: str) -> tuple[str, str]:
-    if direction == "NONE":
-        return "ð´", "NON FARE NULLA"
-    if score >= 85:
-        return "ð¢", f"SETUP {direction} INTERESSANTE"
+def choose_best_direction(
+    h4: dict[str, float | str],
+    h1: dict[str, float | str],
+    m15: dict[str, float | str],
+) -> tuple[str, int, list[str]]:
+    buy_score, buy_reasons = score_direction(
+        "BUY",
+        h4,
+        h1,
+        m15,
+    )
+    sell_score, sell_reasons = score_direction(
+        "SELL",
+        h4,
+        h1,
+        m15,
+    )
+
+    if buy_score >= sell_score:
+        return "BUY", buy_score, buy_reasons
+
+    return "SELL", sell_score, sell_reasons
+
+
+def market_quality(
+    h4: dict[str, float | str],
+    h1: dict[str, float | str],
+) -> int:
+    quality = 0
+
+    # Direzionalita' H4.
+    h4_distance = float(h4["ema_distance"])
+    if h4_distance >= 0.50:
+        quality += 35
+    elif h4_distance >= 0.25:
+        quality += 25
+    elif h4_distance >= 0.10:
+        quality += 12
+
+    # Direzionalita' H1.
+    h1_distance = float(h1["ema_distance"])
+    if h1_distance >= 0.35:
+        quality += 30
+    elif h1_distance >= 0.18:
+        quality += 20
+    elif h1_distance >= 0.08:
+        quality += 10
+
+    # Volatilita' H1.
+    atr_percent = float(h1["atr_percent"])
+    if atr_percent >= 0.80:
+        quality += 25
+    elif atr_percent >= 0.45:
+        quality += 18
+    elif atr_percent >= 0.25:
+        quality += 10
+
+    # Coerenza H4/H1.
+    if h4["trend"] == h1["trend"]:
+        if h4["trend"] != "NEUTRO / LATERALE":
+            quality += 10
+        else:
+            quality += 3
+
+    return min(quality, 100)
+
+
+def determine_state(
+    direction: str,
+    score: int,
+    h4: dict[str, float | str],
+    h1: dict[str, float | str],
+    m15: dict[str, float | str],
+) -> tuple[str, str, str]:
+    expected = "RIALZISTA" if direction == "BUY" else "RIBASSISTA"
+
+    if score >= 85 and m15["trend"] == expected:
+        return (
+            "VERDE",
+            f"SETUP {direction}",
+            "Vale la pena aprire MT4 e controllare il grafico.",
+        )
+
     if score >= 70:
-        return "ð¡", f"PREPARATI: POSSIBILE {direction}"
-    return "ð´", "NON FARE NULLA"
+        if m15["trend"] != expected:
+            return (
+                "GIALLO",
+                f"PREPARAZIONE {direction}",
+                "Il trend e' interessante, ma M15 non ha ancora confermato.",
+            )
+
+        return (
+            "GIALLO",
+            f"POSSIBILE {direction}",
+            "Il setup e' vicino, ma non ha ancora superato tutti i filtri.",
+        )
+
+    return (
+        "ROSSO",
+        "NON FARE NULLA",
+        "Il mercato non offre ancora un setup abbastanza selettivo.",
+    )
 
 
 def format_timeframe(
@@ -344,47 +488,92 @@ def format_timeframe(
     )
 
 
-def build_message(
+def build_console_message(
     h4: dict[str, float | str],
     h1: dict[str, float | str],
     m15: dict[str, float | str],
     direction: str,
     score: int,
+    quality: int,
+    state: str,
+    action: str,
+    explanation: str,
     reasons: list[str],
 ) -> str:
-    icon, action = traffic_light(score, direction)
-    explanation = "\n".join(f"â¢ {reason}" for reason in reasons)
+    reasons_text = "\n".join(
+        f"- {reason}" for reason in reasons
+    )
 
     return (
-        f"{icon} BTC Trend AI v0.5\n\n"
+        "BTC Trend AI v0.6\n\n"
         f"{format_timeframe(h4)}\n\n"
         f"{format_timeframe(h1)}\n\n"
         f"{format_timeframe(m15)}\n\n"
-        f"SCORE SETUP: {score}/100\n"
+        f"QUALITA' MERCATO: {quality}/100\n"
+        f"SCORE {direction}: {score}/100\n"
+        f"STATO: {state}\n"
         f"AZIONE: {action}\n\n"
-        f"Motivi:\n{explanation}\n\n"
-        f"Nota: lo score Ã¨ un filtro tecnico, "
-        f"non una probabilitÃ  garantita di successo."
+        f"SPIEGAZIONE:\n{explanation}\n\n"
+        f"MOTIVI:\n{reasons_text}\n\n"
+        "Nota: lo score e' un filtro tecnico, "
+        "non una garanzia di rendimento."
     )
 
 
-async def send_telegram_alert(
-    bot: Bot,
-    message: str,
-    alert_key: str,
-) -> None:
-    global last_alert_key
+def build_telegram_message(
+    h4: dict[str, float | str],
+    h1: dict[str, float | str],
+    m15: dict[str, float | str],
+    direction: str,
+    score: int,
+    quality: int,
+    state: str,
+    action: str,
+    explanation: str,
+    reasons: list[str],
+) -> str:
+    icons = {
+        "VERDE": "ð¢",
+        "GIALLO": "ð¡",
+        "ROSSO": "ð´",
+    }
 
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    if alert_key == last_alert_key:
+    reasons_text = "\n".join(
+        f"â¢ {reason}" for reason in reasons
+    )
+
+    return (
+        f"{icons[state]} BTC Trend AI v0.6\n\n"
+        f"STATO: {state}\n"
+        f"AZIONE: {action}\n\n"
+        f"Trend H4: {h4['trend']}\n"
+        f"Trend H1: {h1['trend']}\n"
+        f"Trend M15: {m15['trend']}\n\n"
+        f"Qualita' mercato: {quality}/100\n"
+        f"Score {direction}: {score}/100\n\n"
+        f"Cosa significa:\n{explanation}\n\n"
+        f"Perche':\n{reasons_text}\n\n"
+        "Lo score e' un filtro tecnico, "
+        "non una probabilita' garantita di successo."
+    )
+
+
+async def notify_state_change(
+    bot: Bot,
+    state_key: str,
+    telegram_message: str,
+) -> None:
+    global last_notified_state
+
+    if state_key == last_notified_state:
         return
 
     await bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
-        text=message,
+        text=telegram_message,
     )
-    last_alert_key = alert_key
+
+    last_notified_state = state_key
 
 
 async def run_analysis(
@@ -396,6 +585,7 @@ async def run_analysis(
         granularity=3600,
         required_count=830,
     )
+
     m15_history = await fetch_candles(
         session=session,
         granularity=900,
@@ -413,60 +603,94 @@ async def run_analysis(
     h1 = analyze_timeframe(h1_history[-220:], "H1")
     m15 = analyze_timeframe(m15_history[-220:], "M15")
 
-    direction = determine_direction(h4, h1)
-    score, reasons = calculate_setup_score(
-        direction,
+    direction, score, reasons = choose_best_direction(
         h4,
         h1,
         m15,
     )
 
-    message = build_message(
+    quality = market_quality(h4, h1)
+
+    state, action, explanation = determine_state(
+        direction,
+        score,
+        h4,
+        h1,
+        m15,
+    )
+
+    console_message = build_console_message(
         h4,
         h1,
         m15,
         direction,
         score,
+        quality,
+        state,
+        action,
+        explanation,
+        reasons,
+    )
+
+    telegram_message = build_telegram_message(
+        h4,
+        h1,
+        m15,
+        direction,
+        score,
+        quality,
+        state,
+        action,
+        explanation,
         reasons,
     )
 
     now = datetime.now().strftime("%H:%M:%S")
-    print(f"\n{now}\n{message}", flush=True)
+    print(
+        f"\n{now}\n{console_message}",
+        flush=True,
+    )
 
-    if score >= 70 and direction != "NONE":
-        alert_key = (
-            f"{direction}-"
-            f"{score // 5}-"
-            f"{h4['trend']}-"
-            f"{h1['trend']}-"
-            f"{m15['trend']}"
-        )
-        await send_telegram_alert(
-            bot,
-            message,
-            alert_key,
-        )
+    # Telegram solo quando cambia realmente lo stato.
+    state_key = (
+        f"{state}|{action}|"
+        f"{h4['trend']}|{h1['trend']}|{m15['trend']}|"
+        f"{score // 5}|{quality // 10}"
+    )
+
+    await notify_state_change(
+        bot,
+        state_key,
+        telegram_message,
+    )
 
 
 async def main() -> None:
-    print("ð BTC Trend AI v0.5 avviato", flush=True)
-
-    headers = {
-        "User-Agent": "BTC-Trend-AI/0.5",
-        "Accept": "application/json",
-    }
+    print(
+        "BTC Trend AI v0.6 avviato",
+        flush=True,
+    )
 
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN mancante")
+
     if not TELEGRAM_CHAT_ID:
         raise RuntimeError("TELEGRAM_CHAT_ID mancante")
 
+    headers = {
+        "User-Agent": "BTC-Trend-AI/0.6",
+        "Accept": "application/json",
+    }
+
     bot = Bot(token=TELEGRAM_TOKEN)
 
-    async with aiohttp.ClientSession(headers=headers) as session:
+    async with aiohttp.ClientSession(
+        headers=headers
+    ) as session:
         while True:
             try:
                 await run_analysis(session, bot)
+
             except Exception as error:
                 print(
                     "Errore BTC Trend AI:",
