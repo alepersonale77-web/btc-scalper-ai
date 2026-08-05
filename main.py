@@ -33,7 +33,7 @@ def candle_direction(open_price, close_price):
 
 async def main():
 
-  print("🚀 BTC Trend AI v0.3 avviato", flush=True)  
+    print("🚀 BTC Trend AI v0.3 avviato", flush=True)  
 
     while True:
 
