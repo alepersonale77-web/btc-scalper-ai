@@ -14,6 +14,21 @@ EMA_SLOW_PERIOD = 200
 RSI_PERIOD = 14
 ATR_PERIOD = 14
 
+ACCOUNT_CAPITAL_EUR = 1000.0
+FULL_RISK_PERCENT = 2.0
+YELLOW_SIZE_PERCENT = 25.0
+TP1_R_MULTIPLE = 1.5
+TP2_R_MULTIPLE = 2.5
+STOP_ATR_MULTIPLE = 1.20
+
+# Per la size esatta va inserito su Render il valore reale
+# del contratto BTCUSD di FP Markets:
+# BTCUSD_VALUE_PER_USD_MOVE_PER_LOT
+VALUE_PER_USD_MOVE_PER_LOT_RAW = os.environ.get(
+    "BTCUSD_VALUE_PER_USD_MOVE_PER_LOT",
+    "",
+).strip()
+
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
@@ -437,131 +452,184 @@ def market_quality(
     return min(quality, 100)
 
 
+
 def determine_state(
     direction: str,
     score: int,
-    h4: dict[str, float | str],
-    h1: dict[str, float | str],
     m15: dict[str, float | str],
-) -> tuple[str, str, str]:
+) -> tuple[str, str]:
     expected = "RIALZISTA" if direction == "BUY" else "RIBASSISTA"
 
-    if score >= 85 and m15["trend"] == expected:
-        return (
-            "VERDE",
-            f"SETUP {direction}",
-            "Vale la pena aprire MT4 e controllare il grafico.",
-        )
+    price = float(m15["price"])
+    ema50 = float(m15["ema50"])
+    atr = float(m15["atr"])
+    distance_from_ema_in_atr = (
+        abs(price - ema50) / atr
+        if atr > 0
+        else 0.0
+    )
+    too_extended = distance_from_ema_in_atr > 1.25
+
+    if score >= 85 and m15["trend"] == expected and not too_extended:
+        return "VERDE", "SETUP CONFERMATO"
 
     if score >= 70:
-        if m15["trend"] != expected:
-            return (
-                "GIALLO",
-                f"PREPARAZIONE {direction}",
-                "Il trend e' interessante, ma M15 non ha ancora confermato.",
+        if too_extended:
+            return "GIALLO", "PREZZO GIA' AVANZATO - NON INSEGUIRE"
+        return "GIALLO", "SETUP IN PREPARAZIONE"
+
+    return "ROSSO", "NON FARE NULLA"
+
+
+def build_trade_plan(
+    direction: str,
+    state: str,
+    m15: dict[str, float | str],
+    h1: dict[str, float | str],
+) -> dict[str, float | None]:
+    entry = float(m15["price"])
+
+    stop_distance = max(
+        float(h1["atr"]) * STOP_ATR_MULTIPLE,
+        float(m15["atr"]) * 2.0,
+    )
+
+    if direction == "BUY":
+        stop_loss = entry - stop_distance
+        tp1 = entry + stop_distance * TP1_R_MULTIPLE
+        tp2 = entry + stop_distance * TP2_R_MULTIPLE
+    else:
+        stop_loss = entry + stop_distance
+        tp1 = entry - stop_distance * TP1_R_MULTIPLE
+        tp2 = entry - stop_distance * TP2_R_MULTIPLE
+
+    full_risk = ACCOUNT_CAPITAL_EUR * FULL_RISK_PERCENT / 100
+
+    if state == "VERDE":
+        risk_eur = full_risk
+        size_percent = 100.0
+    elif state == "GIALLO":
+        risk_eur = full_risk * YELLOW_SIZE_PERCENT / 100
+        size_percent = YELLOW_SIZE_PERCENT
+    else:
+        risk_eur = 0.0
+        size_percent = 0.0
+
+    tp1_profit_eur = risk_eur * TP1_R_MULTIPLE
+    tp2_profit_eur = risk_eur * TP2_R_MULTIPLE
+
+    lot_size: float | None = None
+
+    if VALUE_PER_USD_MOVE_PER_LOT_RAW and risk_eur > 0:
+        value_per_move = float(VALUE_PER_USD_MOVE_PER_LOT_RAW)
+
+        if value_per_move <= 0:
+            raise ValueError(
+                "BTCUSD_VALUE_PER_USD_MOVE_PER_LOT deve essere positivo"
             )
 
-        return (
-            "GIALLO",
-            f"POSSIBILE {direction}",
-            "Il setup e' vicino, ma non ha ancora superato tutti i filtri.",
+        lot_size = risk_eur / (
+            stop_distance * value_per_move
         )
 
-    return (
-        "ROSSO",
-        "NON FARE NULLA",
-        "Il mercato non offre ancora un setup abbastanza selettivo.",
-    )
-
-
-def format_timeframe(
-    analysis: dict[str, float | str],
-) -> str:
-    return (
-        f"{analysis['timeframe']}: {analysis['trend']}\n"
-        f"Prezzo: {float(analysis['price']):.2f}\n"
-        f"EMA50: {float(analysis['ema50']):.2f} | "
-        f"EMA200: {float(analysis['ema200']):.2f}\n"
-        f"RSI14: {float(analysis['rsi']):.1f} | "
-        f"ATR14: {float(analysis['atr']):.2f} "
-        f"({float(analysis['atr_percent']):.2f}%)"
-    )
-
-
-def build_console_message(
-    h4: dict[str, float | str],
-    h1: dict[str, float | str],
-    m15: dict[str, float | str],
-    direction: str,
-    score: int,
-    quality: int,
-    state: str,
-    action: str,
-    explanation: str,
-    reasons: list[str],
-) -> str:
-    reasons_text = "\n".join(
-        f"- {reason}" for reason in reasons
-    )
-
-    return (
-        "BTC Trend AI v0.6\n\n"
-        f"{format_timeframe(h4)}\n\n"
-        f"{format_timeframe(h1)}\n\n"
-        f"{format_timeframe(m15)}\n\n"
-        f"QUALITA' MERCATO: {quality}/100\n"
-        f"SCORE {direction}: {score}/100\n"
-        f"STATO: {state}\n"
-        f"AZIONE: {action}\n\n"
-        f"SPIEGAZIONE:\n{explanation}\n\n"
-        f"MOTIVI:\n{reasons_text}\n\n"
-        "Nota: lo score e' un filtro tecnico, "
-        "non una garanzia di rendimento."
-    )
-
-
-def build_telegram_message(
-    h4: dict[str, float | str],
-    h1: dict[str, float | str],
-    m15: dict[str, float | str],
-    direction: str,
-    score: int,
-    quality: int,
-    state: str,
-    action: str,
-    explanation: str,
-    reasons: list[str],
-) -> str:
-    icons = {
-        "VERDE": "ð¢",
-        "GIALLO": "ð¡",
-        "ROSSO": "ð´",
+    return {
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "tp1": tp1,
+        "tp2": tp2,
+        "risk_eur": risk_eur,
+        "tp1_profit_eur": tp1_profit_eur,
+        "tp2_profit_eur": tp2_profit_eur,
+        "size_percent": size_percent,
+        "lot_size": lot_size,
     }
 
-    reasons_text = "\n".join(
-        f"â¢ {reason}" for reason in reasons
+
+def setup_label(score: int) -> str:
+    if score >= 91:
+        return "SETUP ECCELLENTE *****"
+    if score >= 85:
+        return "SETUP OTTIMO ****"
+    if score >= 76:
+        return "SETUP BUONO ***"
+    if score >= 70:
+        return "SETUP IN PREPARAZIONE **"
+    return "NESSUN SETUP"
+
+
+def duration_estimate(state: str) -> str:
+    if state == "VERDE":
+        return "6-48 ore"
+    if state == "GIALLO":
+        return "Preallerta: attendere conferma"
+    return "Nessuna operazione"
+
+
+def build_message(
+    state: str,
+    action: str,
+    direction: str,
+    score: int,
+    quality: int,
+    plan: dict[str, float | None],
+) -> str:
+    # Solo caratteri ASCII per eliminare definitivamente
+    # i simboli corrotti visti su Telegram.
+    if state == "ROSSO":
+        return (
+            "[ROSSO] BTC Trend AI v0.7\n\n"
+            "NESSUN SETUP\n\n"
+            f"Direzione osservata: {direction}\n"
+            f"Score: {score}/100\n"
+            f"Qualita' mercato: {quality}/100\n\n"
+            "AZIONE: NON FARE NULLA\n\n"
+            "Il bot continua a controllare il mercato."
+        )
+
+    lot_size = plan["lot_size"]
+
+    if lot_size is None:
+        size_text = (
+            f"{float(plan['size_percent']):.0f}% della size normale\n"
+            "Lotti: da configurare con le specifiche FP Markets"
+        )
+    else:
+        size_text = (
+            f"{float(plan['size_percent']):.0f}% della size normale\n"
+            f"Lotti stimati: {float(lot_size):.4f}"
+        )
+
+    warning = (
+        "Operazione anticipata: conferme non complete."
+        if state == "GIALLO"
+        else "Setup confermato dai filtri del bot."
     )
 
     return (
-        f"{icons[state]} BTC Trend AI v0.6\n\n"
-        f"STATO: {state}\n"
-        f"AZIONE: {action}\n\n"
-        f"Trend H4: {h4['trend']}\n"
-        f"Trend H1: {h1['trend']}\n"
-        f"Trend M15: {m15['trend']}\n\n"
+        f"[{state}] BTC Trend AI v0.7\n\n"
+        f"{setup_label(score)}\n\n"
+        f"{action}\n"
+        f"{direction}\n\n"
+        f"Entrata: {float(plan['entry']):.2f}\n"
+        f"SL: {float(plan['stop_loss']):.2f}\n"
+        f"TP1: {float(plan['tp1']):.2f} "
+        f"(+{float(plan['tp1_profit_eur']):.2f} EUR)\n"
+        f"TP2: {float(plan['tp2']):.2f} "
+        f"(+{float(plan['tp2_profit_eur']):.2f} EUR)\n\n"
+        f"Perdita massima: -{float(plan['risk_eur']):.2f} EUR\n"
+        f"Size: {size_text}\n\n"
+        f"Score setup: {score}/100\n"
         f"Qualita' mercato: {quality}/100\n"
-        f"Score {direction}: {score}/100\n\n"
-        f"Cosa significa:\n{explanation}\n\n"
-        f"Perche':\n{reasons_text}\n\n"
-        "Lo score e' un filtro tecnico, "
-        "non una probabilita' garantita di successo."
+        f"Durata stimata: {duration_estimate(state)}\n\n"
+        f"ATTENZIONE: {warning}\n"
+        "I livelli sono indicativi e non garantiscono profitto."
     )
 
 
 async def notify_state_change(
     bot: Bot,
     state_key: str,
-    telegram_message: str,
+    message: str,
 ) -> None:
     global last_notified_state
 
@@ -570,7 +638,7 @@ async def notify_state_change(
 
     await bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
-        text=telegram_message,
+        text=message,
     )
 
     last_notified_state = state_key
@@ -610,66 +678,33 @@ async def run_analysis(
     )
 
     quality = market_quality(h4, h1)
+    state, action = determine_state(direction, score, m15)
+    plan = build_trade_plan(direction, state, m15, h1)
 
-    state, action, explanation = determine_state(
-        direction,
-        score,
-        h4,
-        h1,
-        m15,
-    )
-
-    console_message = build_console_message(
-        h4,
-        h1,
-        m15,
+    message = build_message(
+        state,
+        action,
         direction,
         score,
         quality,
-        state,
-        action,
-        explanation,
-        reasons,
-    )
-
-    telegram_message = build_telegram_message(
-        h4,
-        h1,
-        m15,
-        direction,
-        score,
-        quality,
-        state,
-        action,
-        explanation,
-        reasons,
+        plan,
     )
 
     now = datetime.now().strftime("%H:%M:%S")
-    print(
-        f"\n{now}\n{console_message}",
-        flush=True,
-    )
+    print(f"\n{now}\n{message}", flush=True)
 
-    # Telegram solo quando cambia realmente lo stato.
-    state_key = (
-        f"{state}|{action}|"
-        f"{h4['trend']}|{h1['trend']}|{m15['trend']}|"
-        f"{score // 5}|{quality // 10}"
-    )
+    # Notifica soltanto quando cambia colore o direzione.
+    state_key = f"{state}|{direction}"
 
     await notify_state_change(
         bot,
         state_key,
-        telegram_message,
+        message,
     )
 
 
 async def main() -> None:
-    print(
-        "BTC Trend AI v0.6 avviato",
-        flush=True,
-    )
+    print("BTC Trend AI v0.7 avviato", flush=True)
 
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN mancante")
@@ -678,15 +713,13 @@ async def main() -> None:
         raise RuntimeError("TELEGRAM_CHAT_ID mancante")
 
     headers = {
-        "User-Agent": "BTC-Trend-AI/0.6",
+        "User-Agent": "BTC-Trend-AI/0.7",
         "Accept": "application/json",
     }
 
     bot = Bot(token=TELEGRAM_TOKEN)
 
-    async with aiohttp.ClientSession(
-        headers=headers
-    ) as session:
+    async with aiohttp.ClientSession(headers=headers) as session:
         while True:
             try:
                 await run_analysis(session, bot)
