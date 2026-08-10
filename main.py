@@ -19,8 +19,8 @@ RSI_PERIOD = 14
 ATR_PERIOD = 14
 ADX_PERIOD = 14
 
-ACCOUNT_CAPITAL_EUR = float(os.environ.get("ACCOUNT_CAPITAL_EUR", "1000"))
-FULL_RISK_PERCENT = float(os.environ.get("FULL_RISK_PERCENT", "2.0"))
+ACCOUNT_CAPITAL_EUR = float(os.environ.get("ACCOUNT_CAPITAL_EUR", "115"))
+FULL_RISK_PERCENT = float(os.environ.get("FULL_RISK_PERCENT", "1.0"))
 YELLOW_RISK_FRACTION = float(os.environ.get("YELLOW_RISK_FRACTION", "0.25"))
 
 TP1_R_MULTIPLE = 1.5
@@ -31,7 +31,7 @@ M15_STOP_ATR_MULTIPLE = 2.80
 STRUCTURE_BUFFER_ATR = 0.35
 MIN_STOP_PERCENT = 0.45
 
-MAX_LOT = float(os.environ.get("MAX_LOT", "0.10"))
+MAX_LOT = float(os.environ.get("MAX_LOT", "0.02"))
 GREEN_CONFIRM_BARS = int(os.environ.get("GREEN_CONFIRM_BARS", "2"))
 
 GREEN_MIN_SCORE = 85
