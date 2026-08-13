@@ -7,7 +7,7 @@ from telegram import Bot
 
 
 # ============================================================
-# BTC TREND AI v0.8.0 - TREND / SWING
+# BTC TREND AI v0.8.1 - TREND / SWING
 # ============================================================
 
 PRODUCT = "BTC-USD"
@@ -743,6 +743,113 @@ def determine_state(
     return "ROSSO", "NON ENTRARE"
 
 
+def trend_label_from_higher_timeframes(
+    h4: dict,
+    h1: dict,
+) -> str:
+    """
+    Descrive il trend di fondo senza confonderlo con il trigger operativo.
+    H4 pesa piu' di H1. Se H4/H1 non sono concordi, il trend e' TRANSIZIONE.
+    """
+    h4_trend = str(h4["trend"])
+    h1_trend = str(h1["trend"])
+
+    if (
+        h4_trend == "RIALZISTA"
+        and h1_trend == "RIALZISTA"
+    ):
+        return "BUY"
+
+    if (
+        h4_trend == "RIBASSISTA"
+        and h1_trend == "RIBASSISTA"
+    ):
+        return "SELL"
+
+    if (
+        h4_trend == "NEUTRO / LATERALE"
+        and h1_trend == "NEUTRO / LATERALE"
+    ):
+        return "NEUTRO"
+
+    return "TRANSIZIONE"
+
+
+def m15_momentum_label(
+    m15: dict,
+) -> str:
+    """
+    Momentum immediato M15. Non decide il trend multiorario.
+    """
+    trend = str(m15["trend"])
+    rsi = float(m15["rsi"])
+
+    if trend == "RIALZISTA":
+        if rsi >= 58:
+            return "RIALZISTA FORTE"
+        return "RIALZISTA"
+
+    if trend == "RIBASSISTA":
+        if rsi <= 42:
+            return "RIBASSISTA FORTE"
+        return "RIBASSISTA"
+
+    return "NEUTRO / LATERALE"
+
+
+def market_phase_label(
+    direction: str,
+    h4: dict,
+    h1: dict,
+    m15: dict,
+) -> str:
+    """
+    Traduce la situazione in linguaggio operativo:
+    - trend + momentum concordi = continuazione
+    - trend e M15 contrari = pullback/rimbalzo contro trend
+    - H4/H1 non allineati = transizione
+    """
+    trend_background = trend_label_from_higher_timeframes(
+        h4,
+        h1,
+    )
+
+    m15_trend = str(m15["trend"])
+
+    if trend_background == "TRANSIZIONE":
+        return "TRANSIZIONE - ATTENDERE CHIAREZZA"
+
+    if trend_background == "NEUTRO":
+        return "LATERALE - NESSUN VANTAGGIO CHIARO"
+
+    expected = (
+        "RIALZISTA"
+        if trend_background == "BUY"
+        else "RIBASSISTA"
+    )
+    opposite = (
+        "RIBASSISTA"
+        if expected == "RIALZISTA"
+        else "RIALZISTA"
+    )
+
+    if m15_trend == expected:
+        return "MOMENTUM ALLINEATO AL TREND"
+
+    if m15_trend == opposite:
+        if trend_background == "BUY":
+            return "PULLBACK RIBASSISTA CONTRO TREND BUY"
+        return "RIMBALZO RIALZISTA CONTRO TREND SELL"
+
+    # Se la direzione scelta dallo score non coincide col trend H4/H1,
+    # lo segnaliamo esplicitamente per evitare interpretazioni errate.
+    if direction != trend_background:
+        return "SEGNALE TECNICO IN CONFLITTO COL TREND DI FONDO"
+
+    return "M15 IN ATTESA DI TRIGGER"
+
+
+
 # =========================
 # SIZE, SL, TP E MARGINE
 # =========================
@@ -978,16 +1085,35 @@ def build_telegram_message(
     score: int,
     quality: int,
     plan: dict,
+    h4: dict,
+    h1: dict,
+    m15: dict,
 ) -> str:
+    trend_background = trend_label_from_higher_timeframes(
+        h4,
+        h1,
+    )
+    momentum = m15_momentum_label(m15)
+    phase = market_phase_label(
+        direction,
+        h4,
+        h1,
+        m15,
+    )
+
     if state == "ROSSO":
         return (
-            "[ROSSO] BTC Trend AI v0.8.0\n\n"
-            "NESSUN SETUP\n\n"
-            f"Direzione osservata: {direction}\n"
+            "[ROSSO] BTC Trend AI v0.8.1\n\n"
+            "NESSUN SETUP OPERATIVO\n\n"
+            f"Trend di fondo H4/H1: {trend_background}\n"
+            f"Momentum M15: {momentum}\n"
+            f"Fase mercato: {phase}\n\n"
+            f"Direzione tecnica osservata: {direction}\n"
             f"Score tecnico: {score}/100\n"
             f"Qualita' mercato: {quality}/100\n\n"
             f"AZIONE: {action}\n\n"
-            "Il bot continua a controllare il mercato."
+            "Il bot non entra finche' trend, qualita' e trigger "
+            "non sono sufficientemente allineati."
         )
 
     lot_size = float(plan["lot_size"])
@@ -1001,19 +1127,24 @@ def build_telegram_message(
             "0.01 lotti puo' essere diverso.\n"
         )
 
-    state_warning = (
-        "Ingresso anticipato: conferme non complete."
-        if state == "GIALLO"
-        else (
+    if state == "GIALLO":
+        state_warning = (
+            "PREALLERTA SOLTANTO: NON APRIRE finche' "
+            "non arriva il VERDE confermato."
+        )
+    else:
+        state_warning = (
             "Setup Trend/Swing confermato. "
             "Lo stop e' strutturale, non da scalping."
         )
-    )
 
     return (
-        f"[{state}] BTC Trend AI v0.8.0\n\n"
+        f"[{state}] BTC Trend AI v0.8.1\n\n"
         f"{setup_label(state, score, quality)}\n\n"
-        f"{direction}\n\n"
+        f"Trend di fondo H4/H1: {trend_background}\n"
+        f"Momentum M15: {momentum}\n"
+        f"Fase mercato: {phase}\n\n"
+        f"Direzione setup: {direction}\n\n"
         f"Entrata: {float(plan['entry']):.2f}\n"
         f"Stop Loss: {float(plan['stop_loss']):.2f}\n"
         f"Distanza SL: {float(plan['stop_distance']):.2f} USD\n"
@@ -1047,7 +1178,7 @@ def build_active_setup_message(
     note: str,
 ) -> str:
     return (
-        f"{title} BTC Trend AI v0.8.0\n\n"
+        f"{title} BTC Trend AI v0.8.1\n\n"
         f"{setup['direction']} - SETUP ATTIVO\n\n"
         f"Entrata originale: {float(setup['entry']):.2f}\n"
         f"Stop Loss: {float(setup['stop_loss']):.2f}\n"
@@ -1338,7 +1469,7 @@ async def run_analysis(
 
     print(
         "\n"
-        f"{now} DEBUG v0.8.0\n"
+        f"{now} DEBUG v0.8.1\n"
         f"Direzione: {direction}\n"
         f"Score: {score}/100 "
         f"(H4={score_parts.get('H4', 0)}, "
@@ -1354,6 +1485,9 @@ async def run_analysis(
         f"M15 trend={m15['trend']} "
         f"RSI={float(m15['rsi']):.1f} "
         f"distEMA50={float(m15['distance_from_ema50_atr']):.2f} ATR\n"
+        f"Trend fondo={trend_label_from_higher_timeframes(h4, h1)} | "
+        f"Momentum M15={m15_momentum_label(m15)} | "
+        f"Fase={market_phase_label(direction, h4, h1, m15)}\n"
         f"Motivi: {', '.join(reasons)}",
         flush=True,
     )
@@ -1417,6 +1551,9 @@ async def run_analysis(
         score,
         quality,
         plan,
+        h4,
+        h1,
+        m15,
     )
 
     print(
@@ -1426,6 +1563,9 @@ async def run_analysis(
 
     state_key = (
         f"{state}|{direction}|"
+        f"{trend_label_from_higher_timeframes(h4, h1)}|"
+        f"{m15_momentum_label(m15)}|"
+        f"{market_phase_label(direction, h4, h1, m15)}|"
         f"{score_band(score)}|"
         f"{quality_band(quality)}"
     )
@@ -1461,7 +1601,7 @@ async def run_analysis(
 
 async def main() -> None:
     print(
-        "BTC Trend AI v0.8.0 Trend/Swing avviato",
+        "BTC Trend AI v0.8.1 Trend/Swing avviato",
         flush=True,
     )
 
@@ -1472,7 +1612,7 @@ async def main() -> None:
         raise RuntimeError("TELEGRAM_CHAT_ID mancante")
 
     headers = {
-        "User-Agent": "BTC-Trend-AI/0.8.0",
+        "User-Agent": "BTC-Trend-AI/0.8.1",
         "Accept": "application/json",
     }
 
