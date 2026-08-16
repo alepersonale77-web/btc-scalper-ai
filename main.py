@@ -7,7 +7,7 @@ from telegram import Bot
 
 
 # ============================================================
-# BTC TREND AI v0.8.2 - TREND / SWING
+# BTC TREND AI v0.8.3 - TREND / SWING
 # ============================================================
 
 PRODUCT = "BTC-USD"
@@ -1140,16 +1140,25 @@ def build_telegram_message(
     h1: dict,
     m15: dict,
 ) -> str:
-    trend_background = trend_label_from_higher_timeframes(h4, h1)
+    trend_background = trend_label_from_higher_timeframes(
+        h4,
+        h1,
+    )
     momentum = m15_momentum_label(m15)
-    phase = market_phase_label(direction, h4, h1, m15)
+    phase = market_phase_label(
+        direction,
+        h4,
+        h1,
+        m15,
+    )
+
     broker_name = str(plan["broker_name"])
     executable = bool(plan["trade_executable"])
-    executable_text = "SI" if executable else "NO"
+    margin_available_text = "SI" if executable else "NO"
 
     if state == "ROSSO":
         return (
-            "[ROSSO] BTC Trend AI v0.8.2\n\n"
+            "[ROSSO] BTC Trend AI v0.8.3\n\n"
             "NESSUN SETUP OPERATIVO\n\n"
             f"Broker operativo: {broker_name}\n"
             f"Trend di fondo H4/H1: {trend_background}\n"
@@ -1159,34 +1168,72 @@ def build_telegram_message(
             f"Score tecnico: {score}/100\n"
             f"Qualita' mercato: {quality}/100\n\n"
             f"AZIONE: {action}\n\n"
-            "Il bot non entra finche' trend, qualita' e trigger non sono sufficientemente allineati."
+            "Il bot non entra finche' trend, qualita' e trigger "
+            "non sono sufficientemente allineati."
         )
 
     lot_size = float(plan["lot_size"])
     warning = ""
+
     if bool(plan["minimum_warning"]):
         warning += (
-            "\nATTENZIONE: la size teorica e' inferiore al minimo negoziabile. "
-            f"Il rischio reale con {lot_size:.2f} lotti puo' essere diverso.\n"
+            "\nATTENZIONE: la size teorica e' inferiore "
+            "al minimo negoziabile. Il rischio reale con "
+            f"{lot_size:.2f} lotti puo' essere diverso.\n"
         )
+
     if not executable:
         warning += (
-            "\nATTENZIONE: OPERAZIONE NON ESEGUIBILE con il capitale impostato per questo broker. "
+            "\nATTENZIONE: capitale/margine insufficiente "
+            "per eseguire questa size sul broker operativo. "
             "Non aumentare il deposito solo per forzare il trade.\n"
         )
 
-    state_warning = (
-        "PREALLERTA SOLTANTO: NON APRIRE finche' non arriva il VERDE confermato."
-        if state == "GIALLO"
-        else "Setup Trend/Swing confermato. Lo stop e' strutturale, non da scalping."
+    if state == "GIALLO":
+        return (
+            "[GIALLO] BTC Trend AI v0.8.3\n\n"
+            f"{setup_label(state, score, quality)}\n\n"
+            "STATO: PREALLERTA - NON ENTRARE\n\n"
+            f"Broker operativo: {broker_name}\n"
+            f"Capitale broker impostato: "
+            f"{float(plan['broker_capital_eur']):.2f} EUR\n"
+            f"Margine disponibile per {lot_size:.2f} lotti: "
+            f"{margin_available_text}\n\n"
+            f"Trend di fondo H4/H1: {trend_background}\n"
+            f"Momentum M15: {momentum}\n"
+            f"Fase mercato: {phase}\n\n"
+            f"Direzione osservata: {direction}\n"
+            f"Entrata indicativa: {float(plan['entry']):.2f}\n"
+            f"Stop indicativo: {float(plan['stop_loss']):.2f}\n"
+            f"TP1 indicativo: {float(plan['tp1']):.2f}\n"
+            f"TP2 indicativo: {float(plan['tp2']):.2f}\n\n"
+            f"Volume minimo/previsto: {lot_size:.2f} lotti\n"
+            f"Perdita massima stimata: "
+            f"-{float(plan['actual_risk_eur']):.2f} EUR\n"
+            f"Margine richiesto stimato: "
+            f"{float(plan['estimated_margin_eur']):.2f} EUR\n\n"
+            f"Affidabilita' tecnica: {score}/100\n"
+            f"Qualita' mercato: {quality}/100\n\n"
+            "AZIONE: ATTENDERE IL VERDE CONFERMATO\n"
+            f"{warning}"
+            "Questa e' solo una preallerta: non aprire il trade."
+        )
+
+    authorization = (
+        "INGRESSO AUTORIZZATO DAL SISTEMA"
+        if executable
+        else "SETUP CONFERMATO MA NON ESEGUIBILE"
     )
 
     return (
-        f"[{state}] BTC Trend AI v0.8.2\n\n"
-        f"{setup_label(state, score, quality)}\n\n"
+        "[VERDE] BTC Trend AI v0.8.3\n\n"
+        f"{setup_label(state, score, quality)}\n"
+        f"{authorization}\n\n"
         f"Broker operativo: {broker_name}\n"
-        f"Capitale broker impostato: {float(plan['broker_capital_eur']):.2f} EUR\n"
-        f"Operazione eseguibile: {executable_text}\n\n"
+        f"Capitale broker impostato: "
+        f"{float(plan['broker_capital_eur']):.2f} EUR\n"
+        f"Operazione eseguibile: "
+        f"{'SI' if executable else 'NO'}\n\n"
         f"Trend di fondo H4/H1: {trend_background}\n"
         f"Momentum M15: {momentum}\n"
         f"Fase mercato: {phase}\n\n"
@@ -1200,9 +1247,12 @@ def build_telegram_message(
         f"Profitto TP2: +{float(plan['tp2_profit_eur']):.2f} EUR\n\n"
         f"Volume consigliato: {lot_size:.2f} lotti\n"
         f"Uso size: {plan['size_label']}\n"
-        f"Perdita massima stimata: -{float(plan['actual_risk_eur']):.2f} EUR\n"
-        f"Margine richiesto stimato: {float(plan['estimated_margin_eur']):.2f} EUR\n"
-        f"Margine/capitale residuo stimato: {float(plan['remaining_after_margin_eur']):.2f} EUR\n\n"
+        f"Perdita massima stimata: "
+        f"-{float(plan['actual_risk_eur']):.2f} EUR\n"
+        f"Margine richiesto stimato: "
+        f"{float(plan['estimated_margin_eur']):.2f} EUR\n"
+        f"Margine/capitale residuo stimato: "
+        f"{float(plan['remaining_after_margin_eur']):.2f} EUR\n\n"
         f"Rischio/Rendimento TP1: 1:{TP1_R_MULTIPLE:.1f}\n"
         f"Rischio/Rendimento TP2: 1:{TP2_R_MULTIPLE:.1f}\n\n"
         f"Affidabilita' tecnica: {score}/100\n"
@@ -1210,8 +1260,8 @@ def build_telegram_message(
         f"Durata stimata: {duration_estimate(state)}\n\n"
         f"AZIONE CONSIGLIATA: {action}\n"
         f"{warning}"
-        f"ATTENZIONE: {state_warning}\n"
-        "I livelli sono indicativi e non garantiscono profitto."
+        "Il VERDE e' il solo stato che autorizza la valutazione "
+        "di un nuovo ingresso."
     )
 
 
@@ -1227,7 +1277,7 @@ def build_active_setup_message(
     if current_price is not None:
         price_line = f"Prezzo attuale: {current_price:.2f}\n"
     return (
-        f"{title} BTC Trend AI v0.8.2\n\n"
+        f"{title} BTC Trend AI v0.8.3\n\n"
         f"{setup['direction']} - POSIZIONE IN MONITORAGGIO\n"
         f"Broker: {setup.get('broker_name', 'N/D')}\n\n"
         f"Entrata originale: {float(setup['entry']):.2f}\n"
@@ -1461,7 +1511,7 @@ async def run_analysis(
 
     print(
         "\n"
-        f"{now} DEBUG v0.8.2\n"
+        f"{now} DEBUG v0.8.3\n"
         f"Direzione: {direction}\n"
         f"Score: {score}/100 "
         f"(H4={score_parts.get('H4', 0)}, "
@@ -1592,7 +1642,7 @@ async def run_analysis(
 
 async def main() -> None:
     print(
-        "BTC Trend AI v0.8.2 Trend/Swing Multi-Broker avviato",
+        "BTC Trend AI v0.8.3 Trend/Swing Multi-Broker avviato",
         flush=True,
     )
 
@@ -1603,7 +1653,7 @@ async def main() -> None:
         raise RuntimeError("TELEGRAM_CHAT_ID mancante")
 
     headers = {
-        "User-Agent": "BTC-Trend-AI/0.8.2",
+        "User-Agent": "BTC-Trend-AI/0.8.3",
         "Accept": "application/json",
     }
 
