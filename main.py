@@ -7,7 +7,7 @@ from telegram import Bot
 
 
 # ============================================================
-# BTC TREND AI v0.8.1 - TREND / SWING
+# BTC TREND AI v0.8.2 - TREND / SWING
 # ============================================================
 
 PRODUCT = "BTC-USD"
@@ -46,6 +46,36 @@ EUR_PER_USD_MOVE_PER_LOT = float(
     os.environ.get("EUR_PER_USD_MOVE_PER_LOT", "0.86")
 )
 
+# =========================
+# BROKER WEEKDAY / WEEKEND
+# =========================
+
+FP_BROKER_NAME = "FP Markets / MT4"
+FP_MIN_LOT = 0.01
+FP_MAX_LOT = float(os.environ.get("FP_MAX_LOT", "0.02"))
+FP_LOT_STEP = 0.01
+FP_CONTRACT_SIZE = 1.0
+FP_MARGIN_PERCENT = float(os.environ.get("FP_MARGIN_PERCENT", "2.0"))
+
+PEPPER_BROKER_NAME = "Pepperstone / MT5"
+PEPPER_MIN_LOT = 0.01
+PEPPER_MAX_LOT = float(os.environ.get("PEPPER_MAX_LOT", "0.01"))
+PEPPER_LOT_STEP = 0.01
+PEPPER_CONTRACT_SIZE = 1.0
+PEPPER_MARGIN_EUR_PER_LOT = float(
+    os.environ.get("PEPPER_MARGIN_EUR_PER_LOT", "27232")
+)
+
+FP_ACCOUNT_CAPITAL_EUR = float(
+    os.environ.get("FP_ACCOUNT_CAPITAL_EUR", "115")
+)
+PEPPER_ACCOUNT_CAPITAL_EUR = float(
+    os.environ.get("PEPPER_ACCOUNT_CAPITAL_EUR", "500")
+)
+MIN_FREE_MARGIN_BUFFER_EUR = float(
+    os.environ.get("MIN_FREE_MARGIN_BUFFER_EUR", "100")
+)
+
 MIN_LOT = 0.01
 LOT_STEP = 0.01
 
@@ -63,6 +93,56 @@ green_candidate_count = 0
 green_candidate_last_m15_time: int | None = None
 
 active_setup: dict | None = None
+
+def active_broker_profile(now_utc: datetime | None = None) -> dict[str, float | str]:
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    weekday = now_utc.weekday()
+    if weekday <= 4:
+        return {
+            "name": FP_BROKER_NAME,
+            "mode": "FP",
+            "capital_eur": FP_ACCOUNT_CAPITAL_EUR,
+            "min_lot": FP_MIN_LOT,
+            "max_lot": FP_MAX_LOT,
+            "lot_step": FP_LOT_STEP,
+            "contract_size": FP_CONTRACT_SIZE,
+            "margin_percent": FP_MARGIN_PERCENT,
+        }
+    return {
+        "name": PEPPER_BROKER_NAME,
+        "mode": "PEPPER",
+        "capital_eur": PEPPER_ACCOUNT_CAPITAL_EUR,
+        "min_lot": PEPPER_MIN_LOT,
+        "max_lot": PEPPER_MAX_LOT,
+        "lot_step": PEPPER_LOT_STEP,
+        "contract_size": PEPPER_CONTRACT_SIZE,
+        "margin_eur_per_lot": PEPPER_MARGIN_EUR_PER_LOT,
+    }
+
+
+def estimate_margin_eur(entry: float, lot_size: float, broker: dict) -> float:
+    if lot_size <= 0:
+        return 0.0
+    if broker["mode"] == "PEPPER":
+        return float(broker["margin_eur_per_lot"]) * lot_size
+    return (
+        entry
+        * float(broker["contract_size"])
+        * lot_size
+        * (float(broker["margin_percent"]) / 100)
+        * EUR_PER_USD_MOVE_PER_LOT
+    )
+
+
+def is_trade_executable(estimated_margin_eur: float, broker: dict) -> tuple[bool, float]:
+    capital = float(broker["capital_eur"])
+    remaining = capital - estimated_margin_eur
+    executable = (
+        estimated_margin_eur <= capital
+        and remaining >= MIN_FREE_MARGIN_BUFFER_EUR
+    )
+    return executable, remaining
 
 
 # =========================
@@ -933,13 +1013,8 @@ def build_trade_plan(
     h1: dict,
 ) -> dict[str, float | str | bool]:
     entry = float(m15["price"])
-
-    stop_distance = calculate_structural_stop_distance(
-        direction,
-        entry,
-        h1,
-        m15,
-    )
+    broker = active_broker_profile()
+    stop_distance = calculate_structural_stop_distance(direction, entry, h1, m15)
 
     if direction == "BUY":
         stop_loss = entry - stop_distance
@@ -950,25 +1025,19 @@ def build_trade_plan(
         tp1 = entry - stop_distance * TP1_R_MULTIPLE
         tp2 = entry - stop_distance * TP2_R_MULTIPLE
 
-    full_risk_eur = (
-        ACCOUNT_CAPITAL_EUR * FULL_RISK_PERCENT / 100
-    )
+    broker_capital = float(broker["capital_eur"])
+    full_risk_eur = broker_capital * FULL_RISK_PERCENT / 100
 
     if state == "VERDE":
         target_risk_eur = full_risk_eur
         size_label = "100% del rischio previsto"
-        lot_cap = MAX_LOT
+        lot_cap = float(broker["max_lot"])
     elif state == "GIALLO":
-        target_risk_eur = (
-            full_risk_eur * YELLOW_RISK_FRACTION
-        )
+        target_risk_eur = full_risk_eur * YELLOW_RISK_FRACTION
         size_label = "25% del rischio previsto"
         lot_cap = max(
-            MIN_LOT,
-            floor_to_step(
-                MAX_LOT * YELLOW_RISK_FRACTION,
-                LOT_STEP,
-            ),
+            float(broker["min_lot"]),
+            floor_to_step(float(broker["max_lot"]) * YELLOW_RISK_FRACTION, float(broker["lot_step"])),
         )
     else:
         target_risk_eur = 0.0
@@ -976,48 +1045,28 @@ def build_trade_plan(
         lot_cap = 0.0
 
     raw_lot_size = 0.0
-
     if target_risk_eur > 0 and stop_distance > 0:
-        raw_lot_size = target_risk_eur / (
-            stop_distance * EUR_PER_USD_MOVE_PER_LOT
-        )
+        raw_lot_size = target_risk_eur / (stop_distance * EUR_PER_USD_MOVE_PER_LOT)
 
-    lot_size = floor_to_step(raw_lot_size, LOT_STEP)
-
+    lot_size = floor_to_step(raw_lot_size, float(broker["lot_step"]))
     if lot_cap > 0:
         lot_size = min(lot_size, lot_cap)
 
     minimum_warning = False
-
-    if (
-        0 < raw_lot_size < MIN_LOT
-        and target_risk_eur > 0
-    ):
-        lot_size = MIN_LOT
+    if 0 < raw_lot_size < float(broker["min_lot"]) and target_risk_eur > 0:
+        lot_size = float(broker["min_lot"])
         minimum_warning = True
 
-    actual_risk_eur = (
-        stop_distance
-        * lot_size
-        * EUR_PER_USD_MOVE_PER_LOT
-    )
-
-    tp1_profit_eur = (
-        actual_risk_eur * TP1_R_MULTIPLE
-    )
-    tp2_profit_eur = (
-        actual_risk_eur * TP2_R_MULTIPLE
-    )
-
-    estimated_margin_eur = (
-        entry
-        * CONTRACT_SIZE
-        * lot_size
-        * (MARGIN_PERCENT / 100)
-        * EUR_PER_USD_MOVE_PER_LOT
-    )
+    actual_risk_eur = stop_distance * lot_size * EUR_PER_USD_MOVE_PER_LOT
+    tp1_profit_eur = actual_risk_eur * TP1_R_MULTIPLE
+    tp2_profit_eur = actual_risk_eur * TP2_R_MULTIPLE
+    estimated_margin_eur = estimate_margin_eur(entry, lot_size, broker)
+    executable, remaining_after_margin = is_trade_executable(estimated_margin_eur, broker)
 
     return {
+        "broker_name": str(broker["name"]),
+        "broker_mode": str(broker["mode"]),
+        "broker_capital_eur": broker_capital,
         "entry": entry,
         "stop_loss": stop_loss,
         "stop_distance": stop_distance,
@@ -1030,6 +1079,8 @@ def build_trade_plan(
         "tp1_profit_eur": tp1_profit_eur,
         "tp2_profit_eur": tp2_profit_eur,
         "estimated_margin_eur": estimated_margin_eur,
+        "remaining_after_margin_eur": remaining_after_margin,
+        "trade_executable": executable,
         "raw_lot_size": raw_lot_size,
         "lot_cap": lot_cap,
         "minimum_warning": minimum_warning,
@@ -1089,22 +1140,18 @@ def build_telegram_message(
     h1: dict,
     m15: dict,
 ) -> str:
-    trend_background = trend_label_from_higher_timeframes(
-        h4,
-        h1,
-    )
+    trend_background = trend_label_from_higher_timeframes(h4, h1)
     momentum = m15_momentum_label(m15)
-    phase = market_phase_label(
-        direction,
-        h4,
-        h1,
-        m15,
-    )
+    phase = market_phase_label(direction, h4, h1, m15)
+    broker_name = str(plan["broker_name"])
+    executable = bool(plan["trade_executable"])
+    executable_text = "SI" if executable else "NO"
 
     if state == "ROSSO":
         return (
-            "[ROSSO] BTC Trend AI v0.8.1\n\n"
+            "[ROSSO] BTC Trend AI v0.8.2\n\n"
             "NESSUN SETUP OPERATIVO\n\n"
+            f"Broker operativo: {broker_name}\n"
             f"Trend di fondo H4/H1: {trend_background}\n"
             f"Momentum M15: {momentum}\n"
             f"Fase mercato: {phase}\n\n"
@@ -1112,35 +1159,34 @@ def build_telegram_message(
             f"Score tecnico: {score}/100\n"
             f"Qualita' mercato: {quality}/100\n\n"
             f"AZIONE: {action}\n\n"
-            "Il bot non entra finche' trend, qualita' e trigger "
-            "non sono sufficientemente allineati."
+            "Il bot non entra finche' trend, qualita' e trigger non sono sufficientemente allineati."
         )
 
     lot_size = float(plan["lot_size"])
-
     warning = ""
-
     if bool(plan["minimum_warning"]):
-        warning = (
-            "\nATTENZIONE: la size teorica e' inferiore "
-            "al minimo negoziabile. Il rischio reale con "
-            "0.01 lotti puo' essere diverso.\n"
+        warning += (
+            "\nATTENZIONE: la size teorica e' inferiore al minimo negoziabile. "
+            f"Il rischio reale con {lot_size:.2f} lotti puo' essere diverso.\n"
+        )
+    if not executable:
+        warning += (
+            "\nATTENZIONE: OPERAZIONE NON ESEGUIBILE con il capitale impostato per questo broker. "
+            "Non aumentare il deposito solo per forzare il trade.\n"
         )
 
-    if state == "GIALLO":
-        state_warning = (
-            "PREALLERTA SOLTANTO: NON APRIRE finche' "
-            "non arriva il VERDE confermato."
-        )
-    else:
-        state_warning = (
-            "Setup Trend/Swing confermato. "
-            "Lo stop e' strutturale, non da scalping."
-        )
+    state_warning = (
+        "PREALLERTA SOLTANTO: NON APRIRE finche' non arriva il VERDE confermato."
+        if state == "GIALLO"
+        else "Setup Trend/Swing confermato. Lo stop e' strutturale, non da scalping."
+    )
 
     return (
-        f"[{state}] BTC Trend AI v0.8.1\n\n"
+        f"[{state}] BTC Trend AI v0.8.2\n\n"
         f"{setup_label(state, score, quality)}\n\n"
+        f"Broker operativo: {broker_name}\n"
+        f"Capitale broker impostato: {float(plan['broker_capital_eur']):.2f} EUR\n"
+        f"Operazione eseguibile: {executable_text}\n\n"
         f"Trend di fondo H4/H1: {trend_background}\n"
         f"Momentum M15: {momentum}\n"
         f"Fase mercato: {phase}\n\n"
@@ -1154,10 +1200,9 @@ def build_telegram_message(
         f"Profitto TP2: +{float(plan['tp2_profit_eur']):.2f} EUR\n\n"
         f"Volume consigliato: {lot_size:.2f} lotti\n"
         f"Uso size: {plan['size_label']}\n"
-        f"Perdita massima stimata: "
-        f"-{float(plan['actual_risk_eur']):.2f} EUR\n"
-        f"Margine richiesto stimato: "
-        f"{float(plan['estimated_margin_eur']):.2f} EUR\n\n"
+        f"Perdita massima stimata: -{float(plan['actual_risk_eur']):.2f} EUR\n"
+        f"Margine richiesto stimato: {float(plan['estimated_margin_eur']):.2f} EUR\n"
+        f"Margine/capitale residuo stimato: {float(plan['remaining_after_margin_eur']):.2f} EUR\n\n"
         f"Rischio/Rendimento TP1: 1:{TP1_R_MULTIPLE:.1f}\n"
         f"Rischio/Rendimento TP2: 1:{TP2_R_MULTIPLE:.1f}\n\n"
         f"Affidabilita' tecnica: {score}/100\n"
@@ -1176,19 +1221,24 @@ def build_active_setup_message(
     score: int,
     quality: int,
     note: str,
+    current_price: float | None = None,
 ) -> str:
+    price_line = ""
+    if current_price is not None:
+        price_line = f"Prezzo attuale: {current_price:.2f}\n"
     return (
-        f"{title} BTC Trend AI v0.8.1\n\n"
-        f"{setup['direction']} - SETUP ATTIVO\n\n"
+        f"{title} BTC Trend AI v0.8.2\n\n"
+        f"{setup['direction']} - POSIZIONE IN MONITORAGGIO\n"
+        f"Broker: {setup.get('broker_name', 'N/D')}\n\n"
         f"Entrata originale: {float(setup['entry']):.2f}\n"
+        f"{price_line}"
         f"Stop Loss: {float(setup['stop_loss']):.2f}\n"
         f"Take Profit 1: {float(setup['tp1']):.2f}\n"
         f"Take Profit 2: {float(setup['tp2']):.2f}\n\n"
         f"Score attuale: {score}/100\n"
         f"Qualita' mercato: {quality}/100\n\n"
         f"AZIONE: {note}\n\n"
-        "Se non hai eseguito il VERDE iniziale, "
-        "considera questo solo come monitoraggio del setup."
+        "Questo NON e' un nuovo segnale d'ingresso."
     )
 
 
@@ -1248,10 +1298,13 @@ def create_active_setup(
         "tp1": float(plan["tp1"]),
         "tp2": float(plan["tp2"]),
         "lot_size": float(plan["lot_size"]),
+        "broker_name": str(plan["broker_name"]),
         "initial_score": score,
         "initial_quality": quality,
         "tp1_hit": False,
-        "status": "MANTIENI",
+        "protection_notified": False,
+        "warning_notified": False,
+        "status": "ATTIVO",
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1266,154 +1319,93 @@ def manage_active_setup(
     m15: dict,
 ) -> tuple[str | None, str | None, bool]:
     direction = str(setup["direction"])
-
+    current_price = float(m15["price"])
     last_low = float(m15["last_low"])
     last_high = float(m15["last_high"])
-
     stop_loss = float(setup["stop_loss"])
     tp1 = float(setup["tp1"])
     tp2 = float(setup["tp2"])
+    entry = float(setup["entry"])
 
     if direction == "BUY":
         stop_hit = last_low <= stop_loss
         tp1_hit_now = last_high >= tp1
         tp2_hit_now = last_high >= tp2
+        favorable_move = current_price - entry
+        total_to_tp1 = tp1 - entry
     else:
         stop_hit = last_high >= stop_loss
         tp1_hit_now = last_low <= tp1
         tp2_hit_now = last_low <= tp2
+        favorable_move = entry - current_price
+        total_to_tp1 = entry - tp1
 
     if stop_hit and tp1_hit_now:
-        message = build_active_setup_message(
-            "[ATTENZIONE]",
-            setup,
-            score,
-            quality,
-            (
-                "Nella stessa candela M15 risultano toccati "
-                "sia area TP sia area SL. Ordine temporale "
-                "non determinabile dai dati candela."
-            ),
-        )
-        return "ACTIVE|AMBIGUO", message, True
+        return "ACTIVE|AMBIGUO", build_active_setup_message(
+            "[ATTENZIONE]", setup, score, quality,
+            "Nella stessa candela M15 risultano toccati sia area TP sia area SL. Ordine temporale non determinabile dai dati candela.",
+            current_price,
+        ), True
 
     if stop_hit:
-        message = build_active_setup_message(
-            "[ROSSO]",
-            setup,
-            score,
-            quality,
-            (
-                "SETUP CHIUSO / INVALIDATO DALLO STOP. "
-                "Non mediare la perdita."
-            ),
-        )
-        return "ACTIVE|STOP", message, True
+        return "ACTIVE|STOP", build_active_setup_message(
+            "[ROSSO]", setup, score, quality,
+            "SETUP CHIUSO / INVALIDATO DALLO STOP. Non mediare la perdita.",
+            current_price,
+        ), True
 
     if tp2_hit_now:
-        message = build_active_setup_message(
-            "[VERDE]",
-            setup,
-            score,
-            quality,
-            "TP2 RAGGIUNTO. Setup completato.",
-        )
-        return "ACTIVE|TP2", message, True
+        return "ACTIVE|TP2", build_active_setup_message(
+            "[VERDE]", setup, score, quality,
+            "TP2 RAGGIUNTO. Setup completato.", current_price,
+        ), True
 
     if tp1_hit_now and not bool(setup["tp1_hit"]):
         setup["tp1_hit"] = True
         setup["status"] = "TP1"
-
-        message = build_active_setup_message(
-            "[VERDE]",
-            setup,
-            score,
-            quality,
-            (
-                "TP1 RAGGIUNTO. Valuta protezione del trade "
-                "e lascia lavorare l'eventuale parte residua."
-            ),
-        )
-
-        return "ACTIVE|TP1", message, False
+        return "ACTIVE|TP1", build_active_setup_message(
+            "[VERDE]", setup, score, quality,
+            "TP1 RAGGIUNTO. Valuta protezione del trade e lascia lavorare solo l'eventuale parte residua.",
+            current_price,
+        ), False
 
     expected = "RIALZISTA" if direction == "BUY" else "RIBASSISTA"
     opposite = "RIBASSISTA" if direction == "BUY" else "RIALZISTA"
 
     hard_invalidated = (
         h4["trend"] == opposite
-        or (
-            h1["trend"] == opposite
-            and score < 55
-        )
+        or (h1["trend"] == opposite and score < 55)
     )
-
     if hard_invalidated:
         setup["status"] = "INVALIDATO"
+        return "ACTIVE|INVALIDATO", build_active_setup_message(
+            "[ROSSO]", setup, score, quality,
+            "STRUTTURA MULTIORARIA INVALIDATA. Valuta uscita: non e' un semplice pullback M15.",
+            current_price,
+        ), True
 
-        message = build_active_setup_message(
-            "[ROSSO]",
-            setup,
-            score,
-            quality,
-            (
-                "STRUTTURA MULTIORARIA INVALIDATA. "
-                "Valuta uscita: non e' un semplice pullback M15."
-            ),
-        )
-
-        return "ACTIVE|INVALIDATO", message, True
+    progress_to_tp1 = favorable_move / total_to_tp1 if total_to_tp1 > 0 else 0.0
+    if progress_to_tp1 >= 0.60 and not bool(setup["protection_notified"]):
+        setup["protection_notified"] = True
+        return "ACTIVE|PROTEGGI", build_active_setup_message(
+            "[VERDE]", setup, score, quality,
+            "PROTEGGI IL TRADE. Il movimento ha percorso almeno il 60% verso TP1. Valuta stop a pareggio o protezione parziale, senza aumentare size.",
+            current_price,
+        ), False
 
     deteriorated = (
-        score < 70
-        or quality < 55
-        or direction_now != direction
-        or m15["trend"] == opposite
+        score < 60
+        or quality < 50
+        or (direction_now != direction and h1["trend"] != expected)
     )
-
-    if deteriorated:
-        if setup["status"] != "ATTENZIONE":
-            setup["status"] = "ATTENZIONE"
-
-            message = build_active_setup_message(
-                "[GIALLO]",
-                setup,
-                score,
-                quality,
-                (
-                    "ATTENZIONE - FORZA RIDOTTA. "
-                    "NON AGGIUNGERE SIZE. "
-                    "Il setup non e' ancora invalidato "
-                    "su H4/H1."
-                ),
-            )
-
-            return "ACTIVE|ATTENZIONE", message, False
-
-        return None, None, False
-
-    if (
-        setup["status"] == "ATTENZIONE"
-        and h4["trend"] == expected
-        and h1["trend"] == expected
-        and score >= 80
-        and quality >= 65
-    ):
-        setup["status"] = "MANTIENI"
-
-        message = build_active_setup_message(
-            "[VERDE]",
-            setup,
-            score,
-            quality,
-            (
-                "CONFERME RECUPERATE - MANTIENI. "
-                "NON AGGIUNGERE una nuova posizione "
-                "solo perche' il verde e' tornato."
-            ),
-        )
-
-        return "ACTIVE|RECUPERO", message, False
+    if deteriorated and not bool(setup["warning_notified"]):
+        setup["warning_notified"] = True
+        setup["status"] = "ATTENZIONE"
+        return "ACTIVE|ATTENZIONE", build_active_setup_message(
+            "[GIALLO]", setup, score, quality,
+            "ATTENZIONE - FORZA RIDOTTA. NON AGGIUNGERE SIZE. Il setup non e' ancora invalidato su H4/H1.",
+            current_price,
+        ), False
 
     return None, None, False
 
@@ -1469,7 +1461,7 @@ async def run_analysis(
 
     print(
         "\n"
-        f"{now} DEBUG v0.8.1\n"
+        f"{now} DEBUG v0.8.2\n"
         f"Direzione: {direction}\n"
         f"Score: {score}/100 "
         f"(H4={score_parts.get('H4', 0)}, "
@@ -1582,7 +1574,7 @@ async def run_analysis(
         message,
     )
 
-    if state == "VERDE":
+    if state == "VERDE" and bool(plan["trade_executable"]):
         active_setup = create_active_setup(
             direction,
             score,
@@ -1593,15 +1585,14 @@ async def run_analysis(
         if sent:
             print(
                 "SETUP ATTIVO creato: "
-                f"{direction} @ "
-                f"{float(plan['entry']):.2f}",
+                f"{direction} @ {float(plan['entry']):.2f} su {plan['broker_name']}",
                 flush=True,
             )
 
 
 async def main() -> None:
     print(
-        "BTC Trend AI v0.8.1 Trend/Swing avviato",
+        "BTC Trend AI v0.8.2 Trend/Swing Multi-Broker avviato",
         flush=True,
     )
 
@@ -1612,7 +1603,7 @@ async def main() -> None:
         raise RuntimeError("TELEGRAM_CHAT_ID mancante")
 
     headers = {
-        "User-Agent": "BTC-Trend-AI/0.8.1",
+        "User-Agent": "BTC-Trend-AI/0.8.2",
         "Accept": "application/json",
     }
 
