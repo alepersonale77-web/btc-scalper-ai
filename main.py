@@ -7,7 +7,7 @@ from telegram import Bot
 
 
 # ============================================================
-# BTC TREND AI v0.8.3 - TREND / SWING
+# BTC TREND AI v0.9 - DUAL: TREND / SWING + SCALP
 # ============================================================
 
 PRODUCT = "BTC-USD"
@@ -38,6 +38,24 @@ GREEN_MIN_SCORE = 85
 GREEN_MIN_QUALITY = 65
 YELLOW_MIN_SCORE = 72
 YELLOW_MIN_QUALITY = 55
+
+# =========================
+# MODALITA' SCALP v0.9
+# =========================
+# Lo scalp e' indipendente dal TREND/SWING.
+# Durata obiettivo: circa 15-60 minuti.
+# H1 = filtro di contesto, M15 = direzione, M5 = trigger.
+# Nessun ordine automatico: Telegram invia soltanto il segnale.
+SCALP_ENABLED = os.environ.get("SCALP_ENABLED", "1") == "1"
+SCALP_GREEN_MIN_SCORE = int(os.environ.get("SCALP_GREEN_MIN_SCORE", "78"))
+SCALP_MIN_QUALITY = int(os.environ.get("SCALP_MIN_QUALITY", "55"))
+SCALP_CONFIRM_BARS = int(os.environ.get("SCALP_CONFIRM_BARS", "2"))
+SCALP_COOLDOWN_MINUTES = int(os.environ.get("SCALP_COOLDOWN_MINUTES", "60"))
+SCALP_MAX_SIGNALS_PER_DAY = int(os.environ.get("SCALP_MAX_SIGNALS_PER_DAY", "5"))
+SCALP_RISK_PERCENT = float(os.environ.get("SCALP_RISK_PERCENT", "0.50"))
+SCALP_STOP_ATR_MULTIPLE = float(os.environ.get("SCALP_STOP_ATR_MULTIPLE", "1.60"))
+SCALP_TP1_R = float(os.environ.get("SCALP_TP1_R", "1.20"))
+SCALP_TP2_R = float(os.environ.get("SCALP_TP2_R", "1.80"))
 
 CONTRACT_SIZE = 1.0
 MARGIN_PERCENT = 2.0
@@ -93,6 +111,15 @@ green_candidate_count = 0
 green_candidate_last_m15_time: int | None = None
 
 active_setup: dict | None = None
+
+# Stato separato per gli scalp: non interferisce con il setup TREND.
+scalp_candidate_direction: str | None = None
+scalp_candidate_count = 0
+scalp_candidate_last_m5_time: int | None = None
+scalp_last_signal_time: datetime | None = None
+scalp_signal_day: str | None = None
+scalp_signals_today = 0
+last_scalp_status_key: str | None = None
 
 def active_broker_profile(now_utc: datetime | None = None) -> dict[str, float | str]:
     if now_utc is None:
@@ -1158,7 +1185,7 @@ def build_telegram_message(
 
     if state == "ROSSO":
         return (
-            "[ROSSO] BTC Trend AI v0.8.3\n\n"
+            "[ROSSO] BTC Trend AI v0.9 TREND\n\n"
             "NESSUN SETUP OPERATIVO\n\n"
             f"Broker operativo: {broker_name}\n"
             f"Trend di fondo H4/H1: {trend_background}\n"
@@ -1191,7 +1218,7 @@ def build_telegram_message(
 
     if state == "GIALLO":
         return (
-            "[GIALLO] BTC Trend AI v0.8.3\n\n"
+            "[GIALLO] BTC Trend AI v0.9 TREND\n\n"
             f"{setup_label(state, score, quality)}\n\n"
             "STATO: PREALLERTA - NON ENTRARE\n\n"
             f"Broker operativo: {broker_name}\n"
@@ -1226,7 +1253,7 @@ def build_telegram_message(
     )
 
     return (
-        "[VERDE] BTC Trend AI v0.8.3\n\n"
+        "[VERDE] BTC Trend AI v0.9 TREND\n\n"
         f"{setup_label(state, score, quality)}\n"
         f"{authorization}\n\n"
         f"Broker operativo: {broker_name}\n"
@@ -1460,6 +1487,333 @@ def manage_active_setup(
     return None, None, False
 
 
+
+# =========================
+# MOTORE SCALP v0.9
+# =========================
+
+def scalp_direction_score(
+    direction: str,
+    h1: dict,
+    m15: dict,
+    m5: dict,
+) -> tuple[int, list[str]]:
+    expected = "RIALZISTA" if direction == "BUY" else "RIBASSISTA"
+    opposite = "RIBASSISTA" if direction == "BUY" else "RIALZISTA"
+    score = 0
+    reasons: list[str] = []
+
+    # H1 e' solo filtro di contesto: non deve per forza essere gia' allineato.
+    if h1["trend"] == expected:
+        score += 20
+        reasons.append("H1 favorevole")
+    elif h1["trend"] == opposite:
+        score -= 12
+        reasons.append("H1 contrario")
+    else:
+        score += 8
+        reasons.append("H1 neutro")
+
+    # M15 decide la direzione dello scalp.
+    if m15["trend"] == expected:
+        score += 30
+        reasons.append("M15 allineato")
+    elif m15["trend"] == opposite:
+        score -= 25
+        reasons.append("M15 contrario")
+    else:
+        # In laterale accettiamo solo prezzo dalla parte giusta della EMA50.
+        if direction == "BUY" and float(m15["price"]) > float(m15["ema50"]):
+            score += 14
+            reasons.append("M15 neutro ma sopra EMA50")
+        elif direction == "SELL" and float(m15["price"]) < float(m15["ema50"]):
+            score += 14
+            reasons.append("M15 neutro ma sotto EMA50")
+
+    rsi15 = float(m15["rsi"])
+    if direction == "BUY" and 50 <= rsi15 <= 70:
+        score += 14
+        reasons.append("RSI M15 favorevole")
+    elif direction == "SELL" and 30 <= rsi15 <= 50:
+        score += 14
+        reasons.append("RSI M15 favorevole")
+
+    # M5 e' il trigger.
+    candle_up = float(m5["last_close"]) > float(m5["last_open"])
+    candle_down = float(m5["last_close"]) < float(m5["last_open"])
+    if direction == "BUY" and float(m5["price"]) > float(m5["ema50"]) and candle_up:
+        score += 24
+        reasons.append("trigger M5 BUY")
+    elif direction == "SELL" and float(m5["price"]) < float(m5["ema50"]) and candle_down:
+        score += 24
+        reasons.append("trigger M5 SELL")
+
+    rsi5 = float(m5["rsi"])
+    if direction == "BUY" and 48 <= rsi5 <= 72:
+        score += 8
+    elif direction == "SELL" and 28 <= rsi5 <= 52:
+        score += 8
+
+    if float(m15["adx"]) >= 18:
+        score += 4
+    if float(m5["adx"]) >= 18:
+        score += 4
+
+    return max(0, min(score, 100)), reasons
+
+
+def choose_scalp_direction(
+    h1: dict,
+    m15: dict,
+    m5: dict,
+) -> tuple[str, int, list[str]]:
+    buy_score, buy_reasons = scalp_direction_score("BUY", h1, m15, m5)
+    sell_score, sell_reasons = scalp_direction_score("SELL", h1, m15, m5)
+    if buy_score >= sell_score:
+        return "BUY", buy_score, buy_reasons
+    return "SELL", sell_score, sell_reasons
+
+
+def scalp_quality(m15: dict, m5: dict) -> int:
+    quality = 45
+    if float(m15["atr_percent"]) >= 0.20:
+        quality += 15
+    if float(m5["atr_percent"]) >= 0.08:
+        quality += 10
+    if float(m15["adx"]) >= 18:
+        quality += 15
+    if float(m5["adx"]) >= 18:
+        quality += 10
+    # Evita di inseguire un prezzo gia' troppo distante dalla EMA50 M15.
+    if float(m15["distance_from_ema50_atr"]) > 1.80:
+        quality -= 20
+    return max(0, min(quality, 100))
+
+
+def scalp_trigger_ok(direction: str, m15: dict, m5: dict) -> bool:
+    candle_up = float(m5["last_close"]) > float(m5["last_open"])
+    candle_down = float(m5["last_close"]) < float(m5["last_open"])
+    if direction == "BUY":
+        return (
+            float(m5["price"]) > float(m5["ema50"])
+            and candle_up
+            and float(m5["rsi"]) >= 48
+            and float(m15["rsi"]) >= 48
+        )
+    return (
+        float(m5["price"]) < float(m5["ema50"])
+        and candle_down
+        and float(m5["rsi"]) <= 52
+        and float(m15["rsi"]) <= 52
+    )
+
+
+def scalp_h1_blocked(direction: str, h1: dict) -> bool:
+    # H1 non deve essere allineato, ma blocca uno scalp contro un trend forte.
+    opposite = "RIBASSISTA" if direction == "BUY" else "RIALZISTA"
+    return h1["trend"] == opposite and float(h1["adx"]) >= 28
+
+
+def update_scalp_confirmation(
+    direction: str,
+    eligible: bool,
+    m5: dict,
+) -> bool:
+    global scalp_candidate_direction
+    global scalp_candidate_count
+    global scalp_candidate_last_m5_time
+
+    bar_time = int(m5["last_candle_time"])
+    if not eligible:
+        scalp_candidate_direction = None
+        scalp_candidate_count = 0
+        scalp_candidate_last_m5_time = None
+        return False
+
+    if scalp_candidate_direction != direction:
+        scalp_candidate_direction = direction
+        scalp_candidate_count = 1
+        scalp_candidate_last_m5_time = bar_time
+        return SCALP_CONFIRM_BARS <= 1
+
+    if scalp_candidate_last_m5_time != bar_time:
+        scalp_candidate_count += 1
+        scalp_candidate_last_m5_time = bar_time
+
+    return scalp_candidate_count >= SCALP_CONFIRM_BARS
+
+
+def scalp_signal_allowed_now() -> tuple[bool, str]:
+    global scalp_last_signal_time
+    global scalp_signal_day
+    global scalp_signals_today
+
+    now = datetime.now(timezone.utc)
+    day_key = now.strftime("%Y-%m-%d")
+    if scalp_signal_day != day_key:
+        scalp_signal_day = day_key
+        scalp_signals_today = 0
+
+    if scalp_signals_today >= SCALP_MAX_SIGNALS_PER_DAY:
+        return False, "limite giornaliero raggiunto"
+
+    if scalp_last_signal_time is not None:
+        elapsed = (now - scalp_last_signal_time).total_seconds() / 60
+        if elapsed < SCALP_COOLDOWN_MINUTES:
+            return False, f"cooldown {SCALP_COOLDOWN_MINUTES} min"
+
+    return True, "ok"
+
+
+def build_scalp_plan(direction: str, m5: dict) -> dict:
+    broker = active_broker_profile()
+    entry = float(m5["price"])
+    atr = float(m5["atr"])
+    stop_distance = max(atr * SCALP_STOP_ATR_MULTIPLE, entry * 0.0015)
+
+    if direction == "BUY":
+        stop = entry - stop_distance
+        tp1 = entry + stop_distance * SCALP_TP1_R
+        tp2 = entry + stop_distance * SCALP_TP2_R
+    else:
+        stop = entry + stop_distance
+        tp1 = entry - stop_distance * SCALP_TP1_R
+        tp2 = entry - stop_distance * SCALP_TP2_R
+
+    capital = float(broker["capital_eur"])
+    target_risk = capital * SCALP_RISK_PERCENT / 100
+    eur_loss_per_lot = stop_distance * EUR_PER_USD_MOVE_PER_LOT
+    raw_lot = target_risk / eur_loss_per_lot if eur_loss_per_lot > 0 else 0.0
+
+    lot = floor_to_step(raw_lot, float(broker["lot_step"]))
+    if lot < float(broker["min_lot"]):
+        lot = float(broker["min_lot"])
+    lot = min(lot, float(broker["max_lot"]))
+
+    estimated_loss = stop_distance * lot * EUR_PER_USD_MOVE_PER_LOT
+    margin = estimate_margin_eur(entry, lot, broker)
+    executable, remaining = is_trade_executable(margin, broker)
+
+    return {
+        "broker_name": str(broker["name"]),
+        "capital": capital,
+        "entry": entry,
+        "stop": stop,
+        "tp1": tp1,
+        "tp2": tp2,
+        "lot": lot,
+        "loss_eur": estimated_loss,
+        "margin_eur": margin,
+        "remaining_eur": remaining,
+        "executable": executable,
+    }
+
+
+def build_scalp_green_message(
+    direction: str,
+    score: int,
+    quality: int,
+    plan: dict,
+    reasons: list[str],
+) -> str:
+    executable_text = "SI" if bool(plan["executable"]) else "NO"
+    return (
+        "[VERDE SCALP] BTC Trend AI v0.9\\n\\n"
+        f"SCALP {direction} - INGRESSO CONFERMATO\\n"
+        "Durata obiettivo: 15-60 minuti\\n\\n"
+        f"Broker operativo: {plan['broker_name']}\\n"
+        f"Margine disponibile per {float(plan['lot']):.2f} lotti: {executable_text}\\n\\n"
+        f"Entrata indicativa: {float(plan['entry']):.2f}\\n"
+        f"Stop Loss: {float(plan['stop']):.2f}\\n"
+        f"Take Profit 1: {float(plan['tp1']):.2f}\\n"
+        f"Take Profit 2: {float(plan['tp2']):.2f}\\n"
+        f"Volume: {float(plan['lot']):.2f} lotti\\n"
+        f"Perdita massima stimata: -{float(plan['loss_eur']):.2f} EUR\\n"
+        f"Margine richiesto stimato: {float(plan['margin_eur']):.2f} EUR\\n\\n"
+        f"Affidabilita' scalp: {score}/100\\n"
+        f"Qualita' mercato: {quality}/100\\n\\n"
+        "AZIONE: VALUTARE INGRESSO SCALP ORA\\n"
+        "Non aggiungere size e non inseguire il prezzo.\\n"
+        f"Conferme: {', '.join(reasons)}\\n\\n"
+        "Segnale tecnico indicativo: non garantisce profitto."
+    )
+
+
+async def evaluate_and_notify_scalp(
+    bot: Bot,
+    h1: dict,
+    m15: dict,
+    m5: dict,
+) -> None:
+    global scalp_last_signal_time
+    global scalp_signals_today
+    global last_scalp_status_key
+
+    if not SCALP_ENABLED:
+        return
+
+    direction, score, reasons = choose_scalp_direction(h1, m15, m5)
+    quality = scalp_quality(m15, m5)
+    trigger = scalp_trigger_ok(direction, m15, m5)
+    blocked = scalp_h1_blocked(direction, h1)
+
+    eligible = (
+        score >= SCALP_GREEN_MIN_SCORE
+        and quality >= SCALP_MIN_QUALITY
+        and trigger
+        and not blocked
+    )
+
+    confirmed = update_scalp_confirmation(direction, eligible, m5)
+
+    print(
+        "\\nSCALP v0.9 | "
+        f"{direction} score={score}/100 quality={quality}/100 "
+        f"trigger={'SI' if trigger else 'NO'} "
+        f"H1_block={'SI' if blocked else 'NO'} "
+        f"conferme={scalp_candidate_count}/{SCALP_CONFIRM_BARS}",
+        flush=True,
+    )
+
+    if not confirmed:
+        return
+
+    allowed, reason = scalp_signal_allowed_now()
+    if not allowed:
+        print(f"SCALP non inviato: {reason}", flush=True)
+        return
+
+    plan = build_scalp_plan(direction, m5)
+    if not bool(plan["executable"]):
+        print(
+            "SCALP confermato tecnicamente ma non eseguibile per margine.",
+            flush=True,
+        )
+        return
+
+    # Una sola notifica per la stessa candela M5/direzione.
+    status_key = f"{direction}|{int(m5['last_candle_time'])}"
+    if status_key == last_scalp_status_key:
+        return
+
+    message = build_scalp_green_message(
+        direction, score, quality, plan, reasons
+    )
+    await bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text=message,
+    )
+
+    last_scalp_status_key = status_key
+    scalp_last_signal_time = datetime.now(timezone.utc)
+    scalp_signals_today += 1
+    print(
+        f"SCALP VERDE inviato: {direction} | "
+        f"{scalp_signals_today}/{SCALP_MAX_SIGNALS_PER_DAY} oggi",
+        flush=True,
+    )
+
+
 # =========================
 # CICLO PRINCIPALE
 # =========================
@@ -1483,6 +1837,12 @@ async def run_analysis(
         required_count=240,
     )
 
+    m5_history = await fetch_candles(
+        session=session,
+        granularity=300,
+        required_count=240,
+    )
+
     h4_history = aggregate_h1_to_h4(h1_history)
 
     if len(h4_history) < EMA_SLOW_PERIOD:
@@ -1493,6 +1853,11 @@ async def run_analysis(
     h4 = analyze_timeframe(h4_history[-220:], "H4")
     h1 = analyze_timeframe(h1_history[-220:], "H1")
     m15 = analyze_timeframe(m15_history[-220:], "M15")
+    m5 = analyze_timeframe(m5_history[-220:], "M5")
+
+    # Motore SCALP separato: puo' generare segnali anche quando
+    # il TREND/SWING e' in ROSSO o in gestione di un setup gia' attivo.
+    await evaluate_and_notify_scalp(bot, h1, m15, m5)
 
     (
         direction,
@@ -1511,7 +1876,7 @@ async def run_analysis(
 
     print(
         "\n"
-        f"{now} DEBUG v0.8.3\n"
+        f"{now} DEBUG v0.9 TREND\n"
         f"Direzione: {direction}\n"
         f"Score: {score}/100 "
         f"(H4={score_parts.get('H4', 0)}, "
@@ -1642,7 +2007,7 @@ async def run_analysis(
 
 async def main() -> None:
     print(
-        "BTC Trend AI v0.8.3 Trend/Swing Multi-Broker avviato",
+        "BTC Trend AI v0.9 DUAL Trend+Scalp Multi-Broker avviato",
         flush=True,
     )
 
@@ -1653,7 +2018,7 @@ async def main() -> None:
         raise RuntimeError("TELEGRAM_CHAT_ID mancante")
 
     headers = {
-        "User-Agent": "BTC-Trend-AI/0.8.3",
+        "User-Agent": "BTC-Trend-AI/0.9",
         "Accept": "application/json",
     }
 
