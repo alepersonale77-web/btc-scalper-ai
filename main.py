@@ -7,7 +7,7 @@ from telegram import Bot
 
 
 # ============================================================
-# BTC TREND AI v0.9 - DUAL: TREND / SWING + SCALP
+# BTC TREND AI v0.9.1 - DUAL: TREND / SWING + SCALP
 # ============================================================
 
 PRODUCT = "BTC-USD"
@@ -40,7 +40,7 @@ YELLOW_MIN_SCORE = 72
 YELLOW_MIN_QUALITY = 55
 
 # =========================
-# MODALITA' SCALP v0.9
+# MODALITA' SCALP v0.9.1
 # =========================
 # Lo scalp e' indipendente dal TREND/SWING.
 # Durata obiettivo: circa 15-60 minuti.
@@ -1185,7 +1185,7 @@ def build_telegram_message(
 
     if state == "ROSSO":
         return (
-            "[ROSSO] BTC Trend AI v0.9 TREND\n\n"
+            "[ROSSO] BTC Trend AI v0.9.1 TREND\n\n"
             "NESSUN SETUP OPERATIVO\n\n"
             f"Broker operativo: {broker_name}\n"
             f"Trend di fondo H4/H1: {trend_background}\n"
@@ -1218,7 +1218,7 @@ def build_telegram_message(
 
     if state == "GIALLO":
         return (
-            "[GIALLO] BTC Trend AI v0.9 TREND\n\n"
+            "[GIALLO] BTC Trend AI v0.9.1 TREND\n\n"
             f"{setup_label(state, score, quality)}\n\n"
             "STATO: PREALLERTA - NON ENTRARE\n\n"
             f"Broker operativo: {broker_name}\n"
@@ -1253,7 +1253,7 @@ def build_telegram_message(
     )
 
     return (
-        "[VERDE] BTC Trend AI v0.9 TREND\n\n"
+        "[VERDE] BTC Trend AI v0.9.1 TREND\n\n"
         f"{setup_label(state, score, quality)}\n"
         f"{authorization}\n\n"
         f"Broker operativo: {broker_name}\n"
@@ -1489,7 +1489,7 @@ def manage_active_setup(
 
 
 # =========================
-# MOTORE SCALP v0.9
+# MOTORE SCALP v0.9.1
 # =========================
 
 def scalp_direction_score(
@@ -1717,24 +1717,35 @@ def build_scalp_green_message(
     reasons: list[str],
 ) -> str:
     executable_text = "SI" if bool(plan["executable"]) else "NO"
+
+    reasons_block = "\n".join(
+        f"- {reason}"
+        for reason in reasons
+    )
+
     return (
-        "[VERDE SCALP] BTC Trend AI v0.9\\n\\n"
-        f"SCALP {direction} - INGRESSO CONFERMATO\\n"
-        "Durata obiettivo: 15-60 minuti\\n\\n"
-        f"Broker operativo: {plan['broker_name']}\\n"
-        f"Margine disponibile per {float(plan['lot']):.2f} lotti: {executable_text}\\n\\n"
-        f"Entrata indicativa: {float(plan['entry']):.2f}\\n"
-        f"Stop Loss: {float(plan['stop']):.2f}\\n"
-        f"Take Profit 1: {float(plan['tp1']):.2f}\\n"
-        f"Take Profit 2: {float(plan['tp2']):.2f}\\n"
-        f"Volume: {float(plan['lot']):.2f} lotti\\n"
-        f"Perdita massima stimata: -{float(plan['loss_eur']):.2f} EUR\\n"
-        f"Margine richiesto stimato: {float(plan['margin_eur']):.2f} EUR\\n\\n"
-        f"Affidabilita' scalp: {score}/100\\n"
-        f"Qualita' mercato: {quality}/100\\n\\n"
-        "AZIONE: VALUTARE INGRESSO SCALP ORA\\n"
-        "Non aggiungere size e non inseguire il prezzo.\\n"
-        f"Conferme: {', '.join(reasons)}\\n\\n"
+        "[VERDE SCALP] BTC Trend AI v0.9.1\n\n"
+        f"SCALP {direction} - INGRESSO CONFERMATO\n"
+        "Durata obiettivo: 15-60 minuti\n\n"
+        f"Broker operativo: {plan['broker_name']}\n"
+        f"Margine disponibile per "
+        f"{float(plan['lot']):.2f} lotti: {executable_text}\n\n"
+        f"Entrata: {float(plan['entry']):.2f}\n"
+        f"Stop Loss: {float(plan['stop']):.2f}\n"
+        f"Take Profit 1: {float(plan['tp1']):.2f}\n"
+        f"Take Profit 2: {float(plan['tp2']):.2f}\n\n"
+        f"Volume: {float(plan['lot']):.2f} lotti\n"
+        f"Perdita massima stimata: "
+        f"-{float(plan['loss_eur']):.2f} EUR\n"
+        f"Margine richiesto stimato: "
+        f"{float(plan['margin_eur']):.2f} EUR\n\n"
+        f"Affidabilita' scalp: {score}/100\n"
+        f"Qualita' mercato: {quality}/100\n\n"
+        "AZIONE:\n"
+        "VALUTARE INGRESSO SCALP ORA\n\n"
+        "Conferme:\n"
+        f"{reasons_block}\n\n"
+        "Non aggiungere size e non inseguire il prezzo.\n"
         "Segnale tecnico indicativo: non garantisce profitto."
     )
 
@@ -1767,7 +1778,7 @@ async def evaluate_and_notify_scalp(
     confirmed = update_scalp_confirmation(direction, eligible, m5)
 
     print(
-        "\\nSCALP v0.9 | "
+        "\\nSCALP v0.9.1 | "
         f"{direction} score={score}/100 quality={quality}/100 "
         f"trigger={'SI' if trigger else 'NO'} "
         f"H1_block={'SI' if blocked else 'NO'} "
@@ -1876,7 +1887,7 @@ async def run_analysis(
 
     print(
         "\n"
-        f"{now} DEBUG v0.9 TREND\n"
+        f"{now} DEBUG v0.9.1 TREND\n"
         f"Direzione: {direction}\n"
         f"Score: {score}/100 "
         f"(H4={score_parts.get('H4', 0)}, "
@@ -2007,7 +2018,7 @@ async def run_analysis(
 
 async def main() -> None:
     print(
-        "BTC Trend AI v0.9 DUAL Trend+Scalp Multi-Broker avviato",
+        "BTC Trend AI v0.9.1 DUAL Trend+Scalp Multi-Broker avviato",
         flush=True,
     )
 
@@ -2018,7 +2029,7 @@ async def main() -> None:
         raise RuntimeError("TELEGRAM_CHAT_ID mancante")
 
     headers = {
-        "User-Agent": "BTC-Trend-AI/0.9",
+        "User-Agent": "BTC-Trend-AI/0.9.1",
         "Accept": "application/json",
     }
 
