@@ -1,13 +1,15 @@
 import asyncio
+import json
 import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import aiohttp
 from telegram import Bot
 
 
 # ============================================================
-# BTC TREND AI v0.9.1 - DUAL: TREND / SWING + SCALP
+# BTC TREND AI v0.9.2 - DUAL: TREND / SWING + SCALP
 # ============================================================
 
 PRODUCT = "BTC-USD"
@@ -40,7 +42,7 @@ YELLOW_MIN_SCORE = 72
 YELLOW_MIN_QUALITY = 55
 
 # =========================
-# MODALITA' SCALP v0.9.1
+# MODALITA' SCALP v0.9.2
 # =========================
 # Lo scalp e' indipendente dal TREND/SWING.
 # Durata obiettivo: circa 15-60 minuti.
@@ -56,6 +58,16 @@ SCALP_RISK_PERCENT = float(os.environ.get("SCALP_RISK_PERCENT", "0.50"))
 SCALP_STOP_ATR_MULTIPLE = float(os.environ.get("SCALP_STOP_ATR_MULTIPLE", "1.60"))
 SCALP_TP1_R = float(os.environ.get("SCALP_TP1_R", "1.20"))
 SCALP_TP2_R = float(os.environ.get("SCALP_TP2_R", "1.80"))
+
+SCALP_PROTECT_AT_R = float(os.environ.get("SCALP_PROTECT_AT_R", "0.80"))
+SCALP_TRACK_MAX_HOURS = float(os.environ.get("SCALP_TRACK_MAX_HOURS", "4"))
+SCALP_JOURNAL_FILE = os.environ.get(
+    "SCALP_JOURNAL_FILE",
+    "/tmp/btc_scalp_journal.jsonl",
+)
+TREND_RED_MIN_NOTIFY_MINUTES = int(
+    os.environ.get("TREND_RED_MIN_NOTIFY_MINUTES", "240")
+)
 
 CONTRACT_SIZE = 1.0
 MARGIN_PERCENT = 2.0
@@ -120,6 +132,9 @@ scalp_last_signal_time: datetime | None = None
 scalp_signal_day: str | None = None
 scalp_signals_today = 0
 last_scalp_status_key: str | None = None
+
+active_scalp_setup: dict | None = None
+last_trend_red_sent_at: datetime | None = None
 
 def active_broker_profile(now_utc: datetime | None = None) -> dict[str, float | str]:
     if now_utc is None:
@@ -1185,7 +1200,7 @@ def build_telegram_message(
 
     if state == "ROSSO":
         return (
-            "[ROSSO] BTC Trend AI v0.9.1 TREND\n\n"
+            "[ROSSO] BTC Trend AI v0.9.2 TREND\n\n"
             "NESSUN SETUP OPERATIVO\n\n"
             f"Broker operativo: {broker_name}\n"
             f"Trend di fondo H4/H1: {trend_background}\n"
@@ -1218,7 +1233,7 @@ def build_telegram_message(
 
     if state == "GIALLO":
         return (
-            "[GIALLO] BTC Trend AI v0.9.1 TREND\n\n"
+            "[GIALLO] BTC Trend AI v0.9.2 TREND\n\n"
             f"{setup_label(state, score, quality)}\n\n"
             "STATO: PREALLERTA - NON ENTRARE\n\n"
             f"Broker operativo: {broker_name}\n"
@@ -1253,7 +1268,7 @@ def build_telegram_message(
     )
 
     return (
-        "[VERDE] BTC Trend AI v0.9.1 TREND\n\n"
+        "[VERDE] BTC Trend AI v0.9.2 TREND\n\n"
         f"{setup_label(state, score, quality)}\n"
         f"{authorization}\n\n"
         f"Broker operativo: {broker_name}\n"
@@ -1345,6 +1360,18 @@ async def notify_state_change(
     message: str,
 ) -> bool:
     global last_notified_state
+    global last_trend_red_sent_at
+
+    now = datetime.now(timezone.utc)
+
+    if state_key.startswith("ROSSO|"):
+        if (
+            last_trend_red_sent_at is not None
+            and (now - last_trend_red_sent_at).total_seconds()
+            < TREND_RED_MIN_NOTIFY_MINUTES * 60
+        ):
+            last_notified_state = state_key
+            return False
 
     if state_key == last_notified_state:
         return False
@@ -1353,6 +1380,9 @@ async def notify_state_change(
         chat_id=TELEGRAM_CHAT_ID,
         text=message,
     )
+
+    if state_key.startswith("ROSSO|"):
+        last_trend_red_sent_at = now
 
     last_notified_state = state_key
     return True
@@ -1488,8 +1518,172 @@ def manage_active_setup(
 
 
 
+
 # =========================
-# MOTORE SCALP v0.9.1
+# JOURNAL E GESTIONE SCALP ATTIVO
+# =========================
+
+def append_scalp_journal(event: dict) -> None:
+    try:
+        payload = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            **event,
+        }
+        Path(SCALP_JOURNAL_FILE).parent.mkdir(parents=True, exist_ok=True)
+        with open(SCALP_JOURNAL_FILE, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except Exception as error:
+        print("Errore journal scalp:", repr(error), flush=True)
+
+
+def create_active_scalp_setup(
+    direction: str,
+    score: int,
+    quality: int,
+    plan: dict,
+) -> dict:
+    return {
+        "direction": direction,
+        "entry": float(plan["entry"]),
+        "stop": float(plan["stop"]),
+        "tp1": float(plan["tp1"]),
+        "tp2": float(plan["tp2"]),
+        "lot": float(plan["lot"]),
+        "broker_name": str(plan["broker_name"]),
+        "score": score,
+        "quality": quality,
+        "tp1_hit": False,
+        "protect_notified": False,
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def build_scalp_management_message(
+    title: str,
+    setup: dict,
+    current_price: float,
+    action: str,
+) -> str:
+    return (
+        f"{title} BTC Trend AI v0.9.2\n\n"
+        f"SCALP {setup['direction']} - POSIZIONE IN MONITORAGGIO\n"
+        f"Broker: {setup['broker_name']}\n\n"
+        f"Entrata: {float(setup['entry']):.2f}\n"
+        f"Prezzo attuale: {current_price:.2f}\n"
+        f"Stop Loss: {float(setup['stop']):.2f}\n"
+        f"Take Profit 1: {float(setup['tp1']):.2f}\n"
+        f"Take Profit 2: {float(setup['tp2']):.2f}\n\n"
+        f"AZIONE: {action}\n\n"
+        "Questo NON e' un nuovo segnale d'ingresso."
+    )
+
+
+def manage_active_scalp_setup(
+    setup: dict,
+    m5: dict,
+) -> tuple[str | None, str | None, bool]:
+    direction = str(setup["direction"])
+    current_price = float(m5["price"])
+    last_low = float(m5["last_low"])
+    last_high = float(m5["last_high"])
+
+    entry = float(setup["entry"])
+    stop = float(setup["stop"])
+    tp1 = float(setup["tp1"])
+    tp2 = float(setup["tp2"])
+
+    if direction == "BUY":
+        stop_hit = last_low <= stop
+        tp1_hit = last_high >= tp1
+        tp2_hit = last_high >= tp2
+        favorable_move = current_price - entry
+        risk_distance = entry - stop
+    else:
+        stop_hit = last_high >= stop
+        tp1_hit = last_low <= tp1
+        tp2_hit = last_low <= tp2
+        favorable_move = entry - current_price
+        risk_distance = stop - entry
+
+    if stop_hit and (tp1_hit or tp2_hit):
+        message = build_scalp_management_message(
+            "[ATTENZIONE SCALP]",
+            setup,
+            current_price,
+            "Nella stessa candela M5 risultano toccati stop e target. Sequenza non determinabile.",
+        )
+        append_scalp_journal({"event": "AMBIGUO", "direction": direction, "entry": entry, "price": current_price})
+        return "SCALP|AMBIGUO", message, True
+
+    if stop_hit:
+        message = build_scalp_management_message(
+            "[ROSSO SCALP]",
+            setup,
+            current_price,
+            "STOP LOSS RAGGIUNTO - SCALP CHIUSO.",
+        )
+        append_scalp_journal({"event": "STOP", "direction": direction, "entry": entry, "price": current_price, "stop": stop})
+        return "SCALP|STOP", message, True
+
+    if tp2_hit:
+        message = build_scalp_management_message(
+            "[VERDE SCALP]",
+            setup,
+            current_price,
+            "TP2 RAGGIUNTO - OBIETTIVO SCALP COMPLETATO.",
+        )
+        append_scalp_journal({"event": "TP2", "direction": direction, "entry": entry, "price": current_price, "tp2": tp2})
+        return "SCALP|TP2", message, True
+
+    if tp1_hit and not bool(setup["tp1_hit"]):
+        setup["tp1_hit"] = True
+        message = build_scalp_management_message(
+            "[VERDE SCALP]",
+            setup,
+            current_price,
+            "TP1 RAGGIUNTO - PROTEGGI IL TRADE. Valuta stop a pareggio e lascia lavorare l'eventuale parte residua verso TP2.",
+        )
+        append_scalp_journal({"event": "TP1", "direction": direction, "entry": entry, "price": current_price, "tp1": tp1})
+        return "SCALP|TP1", message, False
+
+    progress_r = favorable_move / risk_distance if risk_distance > 0 else 0.0
+
+    if (
+        progress_r >= SCALP_PROTECT_AT_R
+        and not bool(setup["protect_notified"])
+        and not bool(setup["tp1_hit"])
+    ):
+        setup["protect_notified"] = True
+        message = build_scalp_management_message(
+            "[GIALLO SCALP]",
+            setup,
+            current_price,
+            f"TRADE IN PROFITTO DI CIRCA {progress_r:.1f}R. Valuta protezione o stop a pareggio. Non aumentare la size.",
+        )
+        append_scalp_journal({"event": "PROTEGGI", "direction": direction, "entry": entry, "price": current_price, "progress_r": progress_r})
+        return "SCALP|PROTEGGI", message, False
+
+    try:
+        opened_at = datetime.fromisoformat(str(setup["opened_at"]))
+        age_hours = (datetime.now(timezone.utc) - opened_at).total_seconds() / 3600
+    except Exception:
+        age_hours = 0.0
+
+    if age_hours >= SCALP_TRACK_MAX_HOURS:
+        message = build_scalp_management_message(
+            "[GIALLO SCALP]",
+            setup,
+            current_price,
+            "SCALP FUORI TEMPO: oltre la finestra prevista. Valuta chiusura manuale o nuova analisi.",
+        )
+        append_scalp_journal({"event": "TIMEOUT", "direction": direction, "entry": entry, "price": current_price, "age_hours": age_hours})
+        return "SCALP|TIMEOUT", message, True
+
+    return None, None, False
+
+
+# =========================
+# MOTORE SCALP v0.9.2
 # =========================
 
 def scalp_direction_score(
@@ -1724,7 +1918,7 @@ def build_scalp_green_message(
     )
 
     return (
-        "[VERDE SCALP] BTC Trend AI v0.9.1\n\n"
+        "[VERDE SCALP] BTC Trend AI v0.9.2\n\n"
         f"SCALP {direction} - INGRESSO CONFERMATO\n"
         "Durata obiettivo: 15-60 minuti\n\n"
         f"Broker operativo: {plan['broker_name']}\n"
@@ -1778,7 +1972,7 @@ async def evaluate_and_notify_scalp(
     confirmed = update_scalp_confirmation(direction, eligible, m5)
 
     print(
-        "\\nSCALP v0.9.1 | "
+        "\\nSCALP v0.9.2 | "
         f"{direction} score={score}/100 quality={quality}/100 "
         f"trigger={'SI' if trigger else 'NO'} "
         f"H1_block={'SI' if blocked else 'NO'} "
@@ -1806,6 +2000,11 @@ async def evaluate_and_notify_scalp(
     status_key = f"{direction}|{int(m5['last_candle_time'])}"
     if status_key == last_scalp_status_key:
         return
+    global active_scalp_setup
+
+    if active_scalp_setup is not None:
+        print("SCALP non inviato: esiste gia' uno scalp attivo.", flush=True)
+        return
 
     message = build_scalp_green_message(
         direction, score, quality, plan, reasons
@@ -1814,6 +2013,26 @@ async def evaluate_and_notify_scalp(
         chat_id=TELEGRAM_CHAT_ID,
         text=message,
     )
+
+    active_scalp_setup = create_active_scalp_setup(
+        direction,
+        score,
+        quality,
+        plan,
+    )
+
+    append_scalp_journal({
+        "event": "ENTRY",
+        "direction": direction,
+        "score": score,
+        "quality": quality,
+        "entry": float(plan["entry"]),
+        "stop": float(plan["stop"]),
+        "tp1": float(plan["tp1"]),
+        "tp2": float(plan["tp2"]),
+        "lot": float(plan["lot"]),
+        "broker": str(plan["broker_name"]),
+    })
 
     last_scalp_status_key = status_key
     scalp_last_signal_time = datetime.now(timezone.utc)
@@ -1866,9 +2085,26 @@ async def run_analysis(
     m15 = analyze_timeframe(m15_history[-220:], "M15")
     m5 = analyze_timeframe(m5_history[-220:], "M5")
 
-    # Motore SCALP separato: puo' generare segnali anche quando
-    # il TREND/SWING e' in ROSSO o in gestione di un setup gia' attivo.
-    await evaluate_and_notify_scalp(bot, h1, m15, m5)
+    global active_scalp_setup
+
+    if active_scalp_setup is not None:
+        _event_key, scalp_message, close_scalp = manage_active_scalp_setup(
+            active_scalp_setup,
+            m5,
+        )
+
+        if scalp_message is not None:
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=scalp_message,
+            )
+
+        if close_scalp:
+            active_scalp_setup = None
+
+    # Cerca un nuovo scalp solo quando non ne esiste gia' uno in monitoraggio.
+    if active_scalp_setup is None:
+        await evaluate_and_notify_scalp(bot, h1, m15, m5)
 
     (
         direction,
@@ -1887,7 +2123,7 @@ async def run_analysis(
 
     print(
         "\n"
-        f"{now} DEBUG v0.9.1 TREND\n"
+        f"{now} DEBUG v0.9.2 TREND\n"
         f"Direzione: {direction}\n"
         f"Score: {score}/100 "
         f"(H4={score_parts.get('H4', 0)}, "
@@ -2018,7 +2254,7 @@ async def run_analysis(
 
 async def main() -> None:
     print(
-        "BTC Trend AI v0.9.1 DUAL Trend+Scalp Multi-Broker avviato",
+        "BTC Trend AI v0.9.2 DUAL Trend+Scalp Multi-Broker avviato",
         flush=True,
     )
 
@@ -2029,7 +2265,7 @@ async def main() -> None:
         raise RuntimeError("TELEGRAM_CHAT_ID mancante")
 
     headers = {
-        "User-Agent": "BTC-Trend-AI/0.9.1",
+        "User-Agent": "BTC-Trend-AI/0.9.2",
         "Accept": "application/json",
     }
 
