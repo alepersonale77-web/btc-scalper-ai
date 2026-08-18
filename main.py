@@ -9,7 +9,7 @@ from telegram import Bot
 
 
 # ============================================================
-# BTC TREND AI v0.9.2 - DUAL: TREND / SWING + SCALP
+# BTC TREND AI v0.9.3 - DUAL: TREND / SWING + SCALP
 # ============================================================
 
 PRODUCT = "BTC-USD"
@@ -42,7 +42,7 @@ YELLOW_MIN_SCORE = 72
 YELLOW_MIN_QUALITY = 55
 
 # =========================
-# MODALITA' SCALP v0.9.2
+# MODALITA' SCALP v0.9.3
 # =========================
 # Lo scalp e' indipendente dal TREND/SWING.
 # Durata obiettivo: circa 15-60 minuti.
@@ -1200,13 +1200,13 @@ def build_telegram_message(
 
     if state == "ROSSO":
         return (
-            "[ROSSO] BTC Trend AI v0.9.2 TREND\n\n"
+            "[NO TRADE - TREND] BTC Trend AI v0.9.3\n\n"
             "NESSUN SETUP OPERATIVO\n\n"
             f"Broker operativo: {broker_name}\n"
             f"Trend di fondo H4/H1: {trend_background}\n"
             f"Momentum M15: {momentum}\n"
             f"Fase mercato: {phase}\n\n"
-            f"Direzione tecnica osservata: {direction}\n"
+            f"Direzione tecnica osservata: {direction} (solo direzione, NON e un ingresso)\n"
             f"Score tecnico: {score}/100\n"
             f"Qualita' mercato: {quality}/100\n\n"
             f"AZIONE: {action}\n\n"
@@ -1233,7 +1233,7 @@ def build_telegram_message(
 
     if state == "GIALLO":
         return (
-            "[GIALLO] BTC Trend AI v0.9.2 TREND\n\n"
+            "[PREALLERTA - TREND] BTC Trend AI v0.9.3\n\n"
             f"{setup_label(state, score, quality)}\n\n"
             "STATO: PREALLERTA - NON ENTRARE\n\n"
             f"Broker operativo: {broker_name}\n"
@@ -1268,7 +1268,7 @@ def build_telegram_message(
     )
 
     return (
-        "[VERDE] BTC Trend AI v0.9.2 TREND\n\n"
+        "[SETUP CONFERMATO - TREND] BTC Trend AI v0.9.3\n\n"
         f"{setup_label(state, score, quality)}\n"
         f"{authorization}\n\n"
         f"Broker operativo: {broker_name}\n"
@@ -1565,7 +1565,7 @@ def build_scalp_management_message(
     action: str,
 ) -> str:
     return (
-        f"{title} BTC Trend AI v0.9.2\n\n"
+        f"{title} BTC Trend AI v0.9.3\n\n"
         f"SCALP {setup['direction']} - POSIZIONE IN MONITORAGGIO\n"
         f"Broker: {setup['broker_name']}\n\n"
         f"Entrata: {float(setup['entry']):.2f}\n"
@@ -1607,7 +1607,7 @@ def manage_active_scalp_setup(
 
     if stop_hit and (tp1_hit or tp2_hit):
         message = build_scalp_management_message(
-            "[ATTENZIONE SCALP]",
+            "[SCALP ATTENZIONE]",
             setup,
             current_price,
             "Nella stessa candela M5 risultano toccati stop e target. Sequenza non determinabile.",
@@ -1617,7 +1617,7 @@ def manage_active_scalp_setup(
 
     if stop_hit:
         message = build_scalp_management_message(
-            "[ROSSO SCALP]",
+            "[SCALP STOP]",
             setup,
             current_price,
             "STOP LOSS RAGGIUNTO - SCALP CHIUSO.",
@@ -1627,7 +1627,7 @@ def manage_active_scalp_setup(
 
     if tp2_hit:
         message = build_scalp_management_message(
-            "[VERDE SCALP]",
+            "[SCALP TARGET]",
             setup,
             current_price,
             "TP2 RAGGIUNTO - OBIETTIVO SCALP COMPLETATO.",
@@ -1638,7 +1638,7 @@ def manage_active_scalp_setup(
     if tp1_hit and not bool(setup["tp1_hit"]):
         setup["tp1_hit"] = True
         message = build_scalp_management_message(
-            "[VERDE SCALP]",
+            "[SCALP TARGET]",
             setup,
             current_price,
             "TP1 RAGGIUNTO - PROTEGGI IL TRADE. Valuta stop a pareggio e lascia lavorare l'eventuale parte residua verso TP2.",
@@ -1655,7 +1655,7 @@ def manage_active_scalp_setup(
     ):
         setup["protect_notified"] = True
         message = build_scalp_management_message(
-            "[GIALLO SCALP]",
+            "[SCALP PROTEZIONE]",
             setup,
             current_price,
             f"TRADE IN PROFITTO DI CIRCA {progress_r:.1f}R. Valuta protezione o stop a pareggio. Non aumentare la size.",
@@ -1671,7 +1671,7 @@ def manage_active_scalp_setup(
 
     if age_hours >= SCALP_TRACK_MAX_HOURS:
         message = build_scalp_management_message(
-            "[GIALLO SCALP]",
+            "[SCALP PROTEZIONE]",
             setup,
             current_price,
             "SCALP FUORI TEMPO: oltre la finestra prevista. Valuta chiusura manuale o nuova analisi.",
@@ -1683,7 +1683,7 @@ def manage_active_scalp_setup(
 
 
 # =========================
-# MOTORE SCALP v0.9.2
+# MOTORE SCALP v0.9.3
 # =========================
 
 def scalp_direction_score(
@@ -1918,7 +1918,7 @@ def build_scalp_green_message(
     )
 
     return (
-        "[VERDE SCALP] BTC Trend AI v0.9.2\n\n"
+        f"[{direction} SCALP - INGRESSO] BTC Trend AI v0.9.3\n\n"
         f"SCALP {direction} - INGRESSO CONFERMATO\n"
         "Durata obiettivo: 15-60 minuti\n\n"
         f"Broker operativo: {plan['broker_name']}\n"
@@ -1972,7 +1972,7 @@ async def evaluate_and_notify_scalp(
     confirmed = update_scalp_confirmation(direction, eligible, m5)
 
     print(
-        "\\nSCALP v0.9.2 | "
+        "\\nSCALP v0.9.3 | "
         f"{direction} score={score}/100 quality={quality}/100 "
         f"trigger={'SI' if trigger else 'NO'} "
         f"H1_block={'SI' if blocked else 'NO'} "
@@ -2123,7 +2123,7 @@ async def run_analysis(
 
     print(
         "\n"
-        f"{now} DEBUG v0.9.2 TREND\n"
+        f"{now} DEBUG v0.9.3 TREND\n"
         f"Direzione: {direction}\n"
         f"Score: {score}/100 "
         f"(H4={score_parts.get('H4', 0)}, "
@@ -2254,7 +2254,7 @@ async def run_analysis(
 
 async def main() -> None:
     print(
-        "BTC Trend AI v0.9.2 DUAL Trend+Scalp Multi-Broker avviato",
+        "BTC Trend AI v0.9.3 DUAL Trend+Scalp Multi-Broker avviato",
         flush=True,
     )
 
@@ -2265,7 +2265,7 @@ async def main() -> None:
         raise RuntimeError("TELEGRAM_CHAT_ID mancante")
 
     headers = {
-        "User-Agent": "BTC-Trend-AI/0.9.2",
+        "User-Agent": "BTC-Trend-AI/0.9.3",
         "Accept": "application/json",
     }
 
