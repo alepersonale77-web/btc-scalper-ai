@@ -9,7 +9,12 @@ from telegram import Bot
 
 
 # ============================================================
-# BTC TREND AI v0.9.3 - DUAL: TREND / SWING + SCALP
+# BTC TREND AI v0.9.4 - DUAL: TREND / SWING + SCALP
+# MODIFICA v0.9.4:
+# - SCALP solo dopo breakout M15 confermato
+# - filtro spazio libero da supporti/resistenze H1
+# - stop scalp dinamico ATR + struttura + distanza minima %
+# - 2 conferme M5 restano obbligatorie
 # ============================================================
 
 PRODUCT = "BTC-USD"
@@ -42,12 +47,8 @@ YELLOW_MIN_SCORE = 72
 YELLOW_MIN_QUALITY = 55
 
 # =========================
-# MODALITA' SCALP v0.9.3
+# MODALITA' SCALP v0.9.4
 # =========================
-# Lo scalp e' indipendente dal TREND/SWING.
-# Durata obiettivo: circa 15-60 minuti.
-# H1 = filtro di contesto, M15 = direzione, M5 = trigger.
-# Nessun ordine automatico: Telegram invia soltanto il segnale.
 SCALP_ENABLED = os.environ.get("SCALP_ENABLED", "1") == "1"
 SCALP_GREEN_MIN_SCORE = int(os.environ.get("SCALP_GREEN_MIN_SCORE", "78"))
 SCALP_MIN_QUALITY = int(os.environ.get("SCALP_MIN_QUALITY", "55"))
@@ -55,9 +56,32 @@ SCALP_CONFIRM_BARS = int(os.environ.get("SCALP_CONFIRM_BARS", "2"))
 SCALP_COOLDOWN_MINUTES = int(os.environ.get("SCALP_COOLDOWN_MINUTES", "60"))
 SCALP_MAX_SIGNALS_PER_DAY = int(os.environ.get("SCALP_MAX_SIGNALS_PER_DAY", "5"))
 SCALP_RISK_PERCENT = float(os.environ.get("SCALP_RISK_PERCENT", "0.50"))
-SCALP_STOP_ATR_MULTIPLE = float(os.environ.get("SCALP_STOP_ATR_MULTIPLE", "1.60"))
-SCALP_TP1_R = float(os.environ.get("SCALP_TP1_R", "1.20"))
-SCALP_TP2_R = float(os.environ.get("SCALP_TP2_R", "1.80"))
+
+# Stop dinamico scalp
+SCALP_STOP_ATR_MULTIPLE = float(os.environ.get("SCALP_STOP_ATR_MULTIPLE", "1.80"))
+SCALP_M15_STOP_ATR_MULTIPLE = float(
+    os.environ.get("SCALP_M15_STOP_ATR_MULTIPLE", "0.90")
+)
+SCALP_STRUCTURE_BUFFER_ATR = float(
+    os.environ.get("SCALP_STRUCTURE_BUFFER_ATR", "0.25")
+)
+SCALP_MIN_STOP_PERCENT = float(
+    os.environ.get("SCALP_MIN_STOP_PERCENT", "0.25")
+)
+
+# Target scalp
+SCALP_TP1_R = float(os.environ.get("SCALP_TP1_R", "1.30"))
+SCALP_TP2_R = float(os.environ.get("SCALP_TP2_R", "2.00"))
+
+# Breakout M15
+SCALP_BREAKOUT_BUFFER_ATR = float(
+    os.environ.get("SCALP_BREAKOUT_BUFFER_ATR", "0.10")
+)
+
+# Spazio minimo verso supporto/resistenza H1:
+# se una barriera H1 e' piu' vicina di questo multiplo del rischio,
+# il trade viene bloccato.
+SCALP_MIN_ROOM_R = float(os.environ.get("SCALP_MIN_ROOM_R", "1.20"))
 
 SCALP_PROTECT_AT_R = float(os.environ.get("SCALP_PROTECT_AT_R", "0.80"))
 SCALP_TRACK_MAX_HOURS = float(os.environ.get("SCALP_TRACK_MAX_HOURS", "4"))
@@ -124,7 +148,6 @@ green_candidate_last_m15_time: int | None = None
 
 active_setup: dict | None = None
 
-# Stato separato per gli scalp: non interferisce con il setup TREND.
 scalp_candidate_direction: str | None = None
 scalp_candidate_count = 0
 scalp_candidate_last_m5_time: int | None = None
@@ -135,6 +158,7 @@ last_scalp_status_key: str | None = None
 
 active_scalp_setup: dict | None = None
 last_trend_red_sent_at: datetime | None = None
+
 
 def active_broker_profile(now_utc: datetime | None = None) -> dict[str, float | str]:
     if now_utc is None:
@@ -516,6 +540,13 @@ def analyze_timeframe(
     recent_low = min(float(candle[1]) for candle in recent)
     recent_high = max(float(candle[2]) for candle in recent)
 
+    # Livelli precedenti, ESCLUDENDO l'ultima candela chiusa.
+    # Servono per sapere se l'ultima candela ha davvero rotto una struttura,
+    # invece di confrontarla con un massimo/minimo che contiene se stessa.
+    previous_recent = candles[-(lookback + 1):-1]
+    previous_recent_low = min(float(candle[1]) for candle in previous_recent)
+    previous_recent_high = max(float(candle[2]) for candle in previous_recent)
+
     last_candle = candles[-1]
 
     return {
@@ -532,6 +563,8 @@ def analyze_timeframe(
         "trend": trend,
         "recent_low": recent_low,
         "recent_high": recent_high,
+        "previous_recent_low": previous_recent_low,
+        "previous_recent_high": previous_recent_high,
         "last_candle_time": int(last_candle[0]),
         "last_low": float(last_candle[1]),
         "last_high": float(last_candle[2]),
@@ -731,7 +764,7 @@ def market_quality(
 
 
 # =========================
-# TRIGGER E STATO
+# TRIGGER E STATO TREND
 # =========================
 
 def m15_trigger_ok(
@@ -869,53 +902,26 @@ def trend_label_from_higher_timeframes(
     h4: dict,
     h1: dict,
 ) -> str:
-    """
-    Descrive il trend di fondo senza confonderlo con il trigger operativo.
-    H4 pesa piu' di H1. Se H4/H1 non sono concordi, il trend e' TRANSIZIONE.
-    """
     h4_trend = str(h4["trend"])
     h1_trend = str(h1["trend"])
 
-    if (
-        h4_trend == "RIALZISTA"
-        and h1_trend == "RIALZISTA"
-    ):
+    if h4_trend == "RIALZISTA" and h1_trend == "RIALZISTA":
         return "BUY"
-
-    if (
-        h4_trend == "RIBASSISTA"
-        and h1_trend == "RIBASSISTA"
-    ):
+    if h4_trend == "RIBASSISTA" and h1_trend == "RIBASSISTA":
         return "SELL"
-
-    if (
-        h4_trend == "NEUTRO / LATERALE"
-        and h1_trend == "NEUTRO / LATERALE"
-    ):
+    if h4_trend == "NEUTRO / LATERALE" and h1_trend == "NEUTRO / LATERALE":
         return "NEUTRO"
-
     return "TRANSIZIONE"
 
 
-def m15_momentum_label(
-    m15: dict,
-) -> str:
-    """
-    Momentum immediato M15. Non decide il trend multiorario.
-    """
+def m15_momentum_label(m15: dict) -> str:
     trend = str(m15["trend"])
     rsi = float(m15["rsi"])
 
     if trend == "RIALZISTA":
-        if rsi >= 58:
-            return "RIALZISTA FORTE"
-        return "RIALZISTA"
-
+        return "RIALZISTA FORTE" if rsi >= 58 else "RIALZISTA"
     if trend == "RIBASSISTA":
-        if rsi <= 42:
-            return "RIBASSISTA FORTE"
-        return "RIBASSISTA"
-
+        return "RIBASSISTA FORTE" if rsi <= 42 else "RIBASSISTA"
     return "NEUTRO / LATERALE"
 
 
@@ -925,35 +931,16 @@ def market_phase_label(
     h1: dict,
     m15: dict,
 ) -> str:
-    """
-    Traduce la situazione in linguaggio operativo:
-    - trend + momentum concordi = continuazione
-    - trend e M15 contrari = pullback/rimbalzo contro trend
-    - H4/H1 non allineati = transizione
-    """
-    trend_background = trend_label_from_higher_timeframes(
-        h4,
-        h1,
-    )
-
+    trend_background = trend_label_from_higher_timeframes(h4, h1)
     m15_trend = str(m15["trend"])
 
     if trend_background == "TRANSIZIONE":
         return "TRANSIZIONE - ATTENDERE CHIAREZZA"
-
     if trend_background == "NEUTRO":
         return "LATERALE - NESSUN VANTAGGIO CHIARO"
 
-    expected = (
-        "RIALZISTA"
-        if trend_background == "BUY"
-        else "RIBASSISTA"
-    )
-    opposite = (
-        "RIBASSISTA"
-        if expected == "RIALZISTA"
-        else "RIALZISTA"
-    )
+    expected = "RIALZISTA" if trend_background == "BUY" else "RIBASSISTA"
+    opposite = "RIBASSISTA" if expected == "RIALZISTA" else "RIALZISTA"
 
     if m15_trend == expected:
         return "MOMENTUM ALLINEATO AL TREND"
@@ -963,23 +950,19 @@ def market_phase_label(
             return "PULLBACK RIBASSISTA CONTRO TREND BUY"
         return "RIMBALZO RIALZISTA CONTRO TREND SELL"
 
-    # Se la direzione scelta dallo score non coincide col trend H4/H1,
-    # lo segnaliamo esplicitamente per evitare interpretazioni errate.
     if direction != trend_background:
         return "SEGNALE TECNICO IN CONFLITTO COL TREND DI FONDO"
 
     return "M15 IN ATTESA DI TRIGGER"
 
 
-
 # =========================
-# SIZE, SL, TP E MARGINE
+# SIZE, SL, TP E MARGINE TREND
 # =========================
 
 def floor_to_step(value: float, step: float) -> float:
     if value <= 0:
         return 0.0
-
     steps = int(value / step)
     return steps * step
 
@@ -998,47 +981,18 @@ def calculate_structural_stop_distance(
         m15_atr * M15_STOP_ATR_MULTIPLE,
     )
 
-    min_percent_distance = (
-        entry * MIN_STOP_PERCENT / 100
-    )
+    min_percent_distance = entry * MIN_STOP_PERCENT / 100
 
     if direction == "BUY":
-        h1_structure_stop = (
-            float(h1["recent_low"])
-            - (m15_atr * STRUCTURE_BUFFER_ATR)
-        )
-        m15_structure_stop = (
-            float(m15["recent_low"])
-            - (m15_atr * STRUCTURE_BUFFER_ATR)
-        )
-
-        h1_structure_distance = max(
-            entry - h1_structure_stop,
-            0.0,
-        )
-        m15_structure_distance = max(
-            entry - m15_structure_stop,
-            0.0,
-        )
-
+        h1_structure_stop = float(h1["recent_low"]) - (m15_atr * STRUCTURE_BUFFER_ATR)
+        m15_structure_stop = float(m15["recent_low"]) - (m15_atr * STRUCTURE_BUFFER_ATR)
+        h1_structure_distance = max(entry - h1_structure_stop, 0.0)
+        m15_structure_distance = max(entry - m15_structure_stop, 0.0)
     else:
-        h1_structure_stop = (
-            float(h1["recent_high"])
-            + (m15_atr * STRUCTURE_BUFFER_ATR)
-        )
-        m15_structure_stop = (
-            float(m15["recent_high"])
-            + (m15_atr * STRUCTURE_BUFFER_ATR)
-        )
-
-        h1_structure_distance = max(
-            h1_structure_stop - entry,
-            0.0,
-        )
-        m15_structure_distance = max(
-            m15_structure_stop - entry,
-            0.0,
-        )
+        h1_structure_stop = float(h1["recent_high"]) + (m15_atr * STRUCTURE_BUFFER_ATR)
+        m15_structure_stop = float(m15["recent_high"]) + (m15_atr * STRUCTURE_BUFFER_ATR)
+        h1_structure_distance = max(h1_structure_stop - entry, 0.0)
+        m15_structure_distance = max(m15_structure_stop - entry, 0.0)
 
     return max(
         atr_distance,
@@ -1079,7 +1033,10 @@ def build_trade_plan(
         size_label = "25% del rischio previsto"
         lot_cap = max(
             float(broker["min_lot"]),
-            floor_to_step(float(broker["max_lot"]) * YELLOW_RISK_FRACTION, float(broker["lot_step"])),
+            floor_to_step(
+                float(broker["max_lot"]) * YELLOW_RISK_FRACTION,
+                float(broker["lot_step"]),
+            ),
         )
     else:
         target_risk_eur = 0.0
@@ -1088,7 +1045,9 @@ def build_trade_plan(
 
     raw_lot_size = 0.0
     if target_risk_eur > 0 and stop_distance > 0:
-        raw_lot_size = target_risk_eur / (stop_distance * EUR_PER_USD_MOVE_PER_LOT)
+        raw_lot_size = target_risk_eur / (
+            stop_distance * EUR_PER_USD_MOVE_PER_LOT
+        )
 
     lot_size = floor_to_step(raw_lot_size, float(broker["lot_step"]))
     if lot_cap > 0:
@@ -1103,7 +1062,9 @@ def build_trade_plan(
     tp1_profit_eur = actual_risk_eur * TP1_R_MULTIPLE
     tp2_profit_eur = actual_risk_eur * TP2_R_MULTIPLE
     estimated_margin_eur = estimate_margin_eur(entry, lot_size, broker)
-    executable, remaining_after_margin = is_trade_executable(estimated_margin_eur, broker)
+    executable, remaining_after_margin = is_trade_executable(
+        estimated_margin_eur, broker
+    )
 
     return {
         "broker_name": str(broker["name"]),
@@ -1129,46 +1090,28 @@ def build_trade_plan(
     }
 
 
-def setup_label(
-    state: str,
-    score: int,
-    quality: int,
-) -> str:
-    if (
-        state == "VERDE"
-        and score >= 92
-        and quality >= 80
-    ):
+def setup_label(state: str, score: int, quality: int) -> str:
+    if state == "VERDE" and score >= 92 and quality >= 80:
         return "SETUP ECCELLENTE - 5 STELLE"
-
-    if (
-        state == "VERDE"
-        and score >= 85
-        and quality >= 65
-    ):
+    if state == "VERDE" and score >= 85 and quality >= 65:
         return "SETUP OTTIMO - 4 STELLE"
-
     if score >= 78 and quality >= 60:
         return "SETUP BUONO - 3 STELLE"
-
     if score >= 72:
         return "SETUP IN PREPARAZIONE - 2 STELLE"
-
     return "NESSUN SETUP"
 
 
 def duration_estimate(state: str) -> str:
     if state == "VERDE":
         return "Trend/Swing: indicativamente 6-48 ore"
-
     if state == "GIALLO":
         return "Preallerta: attendere conferma"
-
     return "Nessuna operazione"
 
 
 # =========================
-# MESSAGGI TELEGRAM
+# MESSAGGI TELEGRAM TREND
 # =========================
 
 def build_telegram_message(
@@ -1182,17 +1125,9 @@ def build_telegram_message(
     h1: dict,
     m15: dict,
 ) -> str:
-    trend_background = trend_label_from_higher_timeframes(
-        h4,
-        h1,
-    )
+    trend_background = trend_label_from_higher_timeframes(h4, h1)
     momentum = m15_momentum_label(m15)
-    phase = market_phase_label(
-        direction,
-        h4,
-        h1,
-        m15,
-    )
+    phase = market_phase_label(direction, h4, h1, m15)
 
     broker_name = str(plan["broker_name"])
     executable = bool(plan["trade_executable"])
@@ -1200,13 +1135,14 @@ def build_telegram_message(
 
     if state == "ROSSO":
         return (
-            "[NO TRADE - TREND] BTC Trend AI v0.9.3\n\n"
+            "[NO TRADE - TREND] BTC Trend AI v0.9.4\n\n"
             "NESSUN SETUP OPERATIVO\n\n"
             f"Broker operativo: {broker_name}\n"
             f"Trend di fondo H4/H1: {trend_background}\n"
             f"Momentum M15: {momentum}\n"
             f"Fase mercato: {phase}\n\n"
-            f"Direzione tecnica osservata: {direction} (solo direzione, NON e un ingresso)\n"
+            f"Direzione tecnica osservata: {direction} "
+            "(solo direzione, NON e un ingresso)\n"
             f"Score tecnico: {score}/100\n"
             f"Qualita' mercato: {quality}/100\n\n"
             f"AZIONE: {action}\n\n"
@@ -1233,7 +1169,7 @@ def build_telegram_message(
 
     if state == "GIALLO":
         return (
-            "[PREALLERTA - TREND] BTC Trend AI v0.9.3\n\n"
+            "[PREALLERTA - TREND] BTC Trend AI v0.9.4\n\n"
             f"{setup_label(state, score, quality)}\n\n"
             "STATO: PREALLERTA - NON ENTRARE\n\n"
             f"Broker operativo: {broker_name}\n"
@@ -1268,14 +1204,13 @@ def build_telegram_message(
     )
 
     return (
-        "[SETUP CONFERMATO - TREND] BTC Trend AI v0.9.3\n\n"
+        "[SETUP CONFERMATO - TREND] BTC Trend AI v0.9.4\n\n"
         f"{setup_label(state, score, quality)}\n"
         f"{authorization}\n\n"
         f"Broker operativo: {broker_name}\n"
         f"Capitale broker impostato: "
         f"{float(plan['broker_capital_eur']):.2f} EUR\n"
-        f"Operazione eseguibile: "
-        f"{'SI' if executable else 'NO'}\n\n"
+        f"Operazione eseguibile: {'SI' if executable else 'NO'}\n\n"
         f"Trend di fondo H4/H1: {trend_background}\n"
         f"Momentum M15: {momentum}\n"
         f"Fase mercato: {phase}\n\n"
@@ -1319,7 +1254,7 @@ def build_active_setup_message(
     if current_price is not None:
         price_line = f"Prezzo attuale: {current_price:.2f}\n"
     return (
-        f"{title} BTC Trend AI v0.8.3\n\n"
+        f"{title} BTC Trend AI v0.9.4\n\n"
         f"{setup['direction']} - POSIZIONE IN MONITORAGGIO\n"
         f"Broker: {setup.get('broker_name', 'N/D')}\n\n"
         f"Entrata originale: {float(setup['entry']):.2f}\n"
@@ -1376,10 +1311,7 @@ async def notify_state_change(
     if state_key == last_notified_state:
         return False
 
-    await bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID,
-        text=message,
-    )
+    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
 
     if state_key.startswith("ROSSO|"):
         last_trend_red_sent_at = now
@@ -1389,7 +1321,7 @@ async def notify_state_change(
 
 
 # =========================
-# GESTIONE SETUP ATTIVO
+# GESTIONE SETUP ATTIVO TREND
 # =========================
 
 def create_active_setup(
@@ -1449,30 +1381,45 @@ def manage_active_setup(
 
     if stop_hit and tp1_hit_now:
         return "ACTIVE|AMBIGUO", build_active_setup_message(
-            "[ATTENZIONE]", setup, score, quality,
-            "Nella stessa candela M15 risultano toccati sia area TP sia area SL. Ordine temporale non determinabile dai dati candela.",
+            "[ATTENZIONE]",
+            setup,
+            score,
+            quality,
+            "Nella stessa candela M15 risultano toccati sia area TP sia area SL. "
+            "Ordine temporale non determinabile dai dati candela.",
             current_price,
         ), True
 
     if stop_hit:
         return "ACTIVE|STOP", build_active_setup_message(
-            "[ROSSO]", setup, score, quality,
+            "[ROSSO]",
+            setup,
+            score,
+            quality,
             "SETUP CHIUSO / INVALIDATO DALLO STOP. Non mediare la perdita.",
             current_price,
         ), True
 
     if tp2_hit_now:
         return "ACTIVE|TP2", build_active_setup_message(
-            "[VERDE]", setup, score, quality,
-            "TP2 RAGGIUNTO. Setup completato.", current_price,
+            "[VERDE]",
+            setup,
+            score,
+            quality,
+            "TP2 RAGGIUNTO. Setup completato.",
+            current_price,
         ), True
 
     if tp1_hit_now and not bool(setup["tp1_hit"]):
         setup["tp1_hit"] = True
         setup["status"] = "TP1"
         return "ACTIVE|TP1", build_active_setup_message(
-            "[VERDE]", setup, score, quality,
-            "TP1 RAGGIUNTO. Valuta protezione del trade e lascia lavorare solo l'eventuale parte residua.",
+            "[VERDE]",
+            setup,
+            score,
+            quality,
+            "TP1 RAGGIUNTO. Valuta protezione del trade e lascia lavorare "
+            "solo l'eventuale parte residua.",
             current_price,
         ), False
 
@@ -1486,17 +1433,27 @@ def manage_active_setup(
     if hard_invalidated:
         setup["status"] = "INVALIDATO"
         return "ACTIVE|INVALIDATO", build_active_setup_message(
-            "[ROSSO]", setup, score, quality,
-            "STRUTTURA MULTIORARIA INVALIDATA. Valuta uscita: non e' un semplice pullback M15.",
+            "[ROSSO]",
+            setup,
+            score,
+            quality,
+            "STRUTTURA MULTIORARIA INVALIDATA. Valuta uscita: "
+            "non e' un semplice pullback M15.",
             current_price,
         ), True
 
-    progress_to_tp1 = favorable_move / total_to_tp1 if total_to_tp1 > 0 else 0.0
+    progress_to_tp1 = (
+        favorable_move / total_to_tp1 if total_to_tp1 > 0 else 0.0
+    )
     if progress_to_tp1 >= 0.60 and not bool(setup["protection_notified"]):
         setup["protection_notified"] = True
         return "ACTIVE|PROTEGGI", build_active_setup_message(
-            "[VERDE]", setup, score, quality,
-            "PROTEGGI IL TRADE. Il movimento ha percorso almeno il 60% verso TP1. Valuta stop a pareggio o protezione parziale, senza aumentare size.",
+            "[VERDE]",
+            setup,
+            score,
+            quality,
+            "PROTEGGI IL TRADE. Il movimento ha percorso almeno il 60% verso TP1. "
+            "Valuta stop a pareggio o protezione parziale, senza aumentare size.",
             current_price,
         ), False
 
@@ -1509,14 +1466,16 @@ def manage_active_setup(
         setup["warning_notified"] = True
         setup["status"] = "ATTENZIONE"
         return "ACTIVE|ATTENZIONE", build_active_setup_message(
-            "[GIALLO]", setup, score, quality,
-            "ATTENZIONE - FORZA RIDOTTA. NON AGGIUNGERE SIZE. Il setup non e' ancora invalidato su H4/H1.",
+            "[GIALLO]",
+            setup,
+            score,
+            quality,
+            "ATTENZIONE - FORZA RIDOTTA. NON AGGIUNGERE SIZE. "
+            "Il setup non e' ancora invalidato su H4/H1.",
             current_price,
         ), False
 
     return None, None, False
-
-
 
 
 # =========================
@@ -1565,7 +1524,7 @@ def build_scalp_management_message(
     action: str,
 ) -> str:
     return (
-        f"{title} BTC Trend AI v0.9.3\n\n"
+        f"{title} BTC Trend AI v0.9.4\n\n"
         f"SCALP {setup['direction']} - POSIZIONE IN MONITORAGGIO\n"
         f"Broker: {setup['broker_name']}\n\n"
         f"Entrata: {float(setup['entry']):.2f}\n"
@@ -1610,9 +1569,15 @@ def manage_active_scalp_setup(
             "[SCALP ATTENZIONE]",
             setup,
             current_price,
-            "Nella stessa candela M5 risultano toccati stop e target. Sequenza non determinabile.",
+            "Nella stessa candela M5 risultano toccati stop e target. "
+            "Sequenza non determinabile.",
         )
-        append_scalp_journal({"event": "AMBIGUO", "direction": direction, "entry": entry, "price": current_price})
+        append_scalp_journal({
+            "event": "AMBIGUO",
+            "direction": direction,
+            "entry": entry,
+            "price": current_price,
+        })
         return "SCALP|AMBIGUO", message, True
 
     if stop_hit:
@@ -1622,7 +1587,13 @@ def manage_active_scalp_setup(
             current_price,
             "STOP LOSS RAGGIUNTO - SCALP CHIUSO.",
         )
-        append_scalp_journal({"event": "STOP", "direction": direction, "entry": entry, "price": current_price, "stop": stop})
+        append_scalp_journal({
+            "event": "STOP",
+            "direction": direction,
+            "entry": entry,
+            "price": current_price,
+            "stop": stop,
+        })
         return "SCALP|STOP", message, True
 
     if tp2_hit:
@@ -1632,7 +1603,13 @@ def manage_active_scalp_setup(
             current_price,
             "TP2 RAGGIUNTO - OBIETTIVO SCALP COMPLETATO.",
         )
-        append_scalp_journal({"event": "TP2", "direction": direction, "entry": entry, "price": current_price, "tp2": tp2})
+        append_scalp_journal({
+            "event": "TP2",
+            "direction": direction,
+            "entry": entry,
+            "price": current_price,
+            "tp2": tp2,
+        })
         return "SCALP|TP2", message, True
 
     if tp1_hit and not bool(setup["tp1_hit"]):
@@ -1641,9 +1618,16 @@ def manage_active_scalp_setup(
             "[SCALP TARGET]",
             setup,
             current_price,
-            "TP1 RAGGIUNTO - PROTEGGI IL TRADE. Valuta stop a pareggio e lascia lavorare l'eventuale parte residua verso TP2.",
+            "TP1 RAGGIUNTO - PROTEGGI IL TRADE. Valuta stop a pareggio "
+            "e lascia lavorare l'eventuale parte residua verso TP2.",
         )
-        append_scalp_journal({"event": "TP1", "direction": direction, "entry": entry, "price": current_price, "tp1": tp1})
+        append_scalp_journal({
+            "event": "TP1",
+            "direction": direction,
+            "entry": entry,
+            "price": current_price,
+            "tp1": tp1,
+        })
         return "SCALP|TP1", message, False
 
     progress_r = favorable_move / risk_distance if risk_distance > 0 else 0.0
@@ -1658,14 +1642,23 @@ def manage_active_scalp_setup(
             "[SCALP PROTEZIONE]",
             setup,
             current_price,
-            f"TRADE IN PROFITTO DI CIRCA {progress_r:.1f}R. Valuta protezione o stop a pareggio. Non aumentare la size.",
+            f"TRADE IN PROFITTO DI CIRCA {progress_r:.1f}R. "
+            "Valuta protezione o stop a pareggio. Non aumentare la size.",
         )
-        append_scalp_journal({"event": "PROTEGGI", "direction": direction, "entry": entry, "price": current_price, "progress_r": progress_r})
+        append_scalp_journal({
+            "event": "PROTEGGI",
+            "direction": direction,
+            "entry": entry,
+            "price": current_price,
+            "progress_r": progress_r,
+        })
         return "SCALP|PROTEGGI", message, False
 
     try:
         opened_at = datetime.fromisoformat(str(setup["opened_at"]))
-        age_hours = (datetime.now(timezone.utc) - opened_at).total_seconds() / 3600
+        age_hours = (
+            datetime.now(timezone.utc) - opened_at
+        ).total_seconds() / 3600
     except Exception:
         age_hours = 0.0
 
@@ -1674,16 +1667,23 @@ def manage_active_scalp_setup(
             "[SCALP PROTEZIONE]",
             setup,
             current_price,
-            "SCALP FUORI TEMPO: oltre la finestra prevista. Valuta chiusura manuale o nuova analisi.",
+            "SCALP FUORI TEMPO: oltre la finestra prevista. "
+            "Valuta chiusura manuale o nuova analisi.",
         )
-        append_scalp_journal({"event": "TIMEOUT", "direction": direction, "entry": entry, "price": current_price, "age_hours": age_hours})
+        append_scalp_journal({
+            "event": "TIMEOUT",
+            "direction": direction,
+            "entry": entry,
+            "price": current_price,
+            "age_hours": age_hours,
+        })
         return "SCALP|TIMEOUT", message, True
 
     return None, None, False
 
 
 # =========================
-# MOTORE SCALP v0.9.3
+# MOTORE SCALP v0.9.4
 # =========================
 
 def scalp_direction_score(
@@ -1697,7 +1697,6 @@ def scalp_direction_score(
     score = 0
     reasons: list[str] = []
 
-    # H1 e' solo filtro di contesto: non deve per forza essere gia' allineato.
     if h1["trend"] == expected:
         score += 20
         reasons.append("H1 favorevole")
@@ -1708,7 +1707,6 @@ def scalp_direction_score(
         score += 8
         reasons.append("H1 neutro")
 
-    # M15 decide la direzione dello scalp.
     if m15["trend"] == expected:
         score += 30
         reasons.append("M15 allineato")
@@ -1716,7 +1714,6 @@ def scalp_direction_score(
         score -= 25
         reasons.append("M15 contrario")
     else:
-        # In laterale accettiamo solo prezzo dalla parte giusta della EMA50.
         if direction == "BUY" and float(m15["price"]) > float(m15["ema50"]):
             score += 14
             reasons.append("M15 neutro ma sopra EMA50")
@@ -1732,13 +1729,21 @@ def scalp_direction_score(
         score += 14
         reasons.append("RSI M15 favorevole")
 
-    # M5 e' il trigger.
     candle_up = float(m5["last_close"]) > float(m5["last_open"])
     candle_down = float(m5["last_close"]) < float(m5["last_open"])
-    if direction == "BUY" and float(m5["price"]) > float(m5["ema50"]) and candle_up:
+
+    if (
+        direction == "BUY"
+        and float(m5["price"]) > float(m5["ema50"])
+        and candle_up
+    ):
         score += 24
         reasons.append("trigger M5 BUY")
-    elif direction == "SELL" and float(m5["price"]) < float(m5["ema50"]) and candle_down:
+    elif (
+        direction == "SELL"
+        and float(m5["price"]) < float(m5["ema50"])
+        and candle_down
+    ):
         score += 24
         reasons.append("trigger M5 SELL")
 
@@ -1763,6 +1768,7 @@ def choose_scalp_direction(
 ) -> tuple[str, int, list[str]]:
     buy_score, buy_reasons = scalp_direction_score("BUY", h1, m15, m5)
     sell_score, sell_reasons = scalp_direction_score("SELL", h1, m15, m5)
+
     if buy_score >= sell_score:
         return "BUY", buy_score, buy_reasons
     return "SELL", sell_score, sell_reasons
@@ -1770,6 +1776,7 @@ def choose_scalp_direction(
 
 def scalp_quality(m15: dict, m5: dict) -> int:
     quality = 45
+
     if float(m15["atr_percent"]) >= 0.20:
         quality += 15
     if float(m5["atr_percent"]) >= 0.08:
@@ -1778,15 +1785,16 @@ def scalp_quality(m15: dict, m5: dict) -> int:
         quality += 15
     if float(m5["adx"]) >= 18:
         quality += 10
-    # Evita di inseguire un prezzo gia' troppo distante dalla EMA50 M15.
     if float(m15["distance_from_ema50_atr"]) > 1.80:
         quality -= 20
+
     return max(0, min(quality, 100))
 
 
 def scalp_trigger_ok(direction: str, m15: dict, m5: dict) -> bool:
     candle_up = float(m5["last_close"]) > float(m5["last_open"])
     candle_down = float(m5["last_close"]) < float(m5["last_open"])
+
     if direction == "BUY":
         return (
             float(m5["price"]) > float(m5["ema50"])
@@ -1794,6 +1802,7 @@ def scalp_trigger_ok(direction: str, m15: dict, m5: dict) -> bool:
             and float(m5["rsi"]) >= 48
             and float(m15["rsi"]) >= 48
         )
+
     return (
         float(m5["price"]) < float(m5["ema50"])
         and candle_down
@@ -1803,9 +1812,182 @@ def scalp_trigger_ok(direction: str, m15: dict, m5: dict) -> bool:
 
 
 def scalp_h1_blocked(direction: str, h1: dict) -> bool:
-    # H1 non deve essere allineato, ma blocca uno scalp contro un trend forte.
     opposite = "RIBASSISTA" if direction == "BUY" else "RIALZISTA"
     return h1["trend"] == opposite and float(h1["adx"]) >= 28
+
+
+def scalp_breakout_ok(
+    direction: str,
+    m15: dict,
+) -> tuple[bool, str]:
+    """
+    Richiede che L'ULTIMA CANDELA M15 CHIUSA abbia superato il massimo/minimo
+    delle precedenti candele del lookback, con un piccolo buffer ATR.
+    """
+    close = float(m15["last_close"])
+    atr = float(m15["atr"])
+    buffer_value = atr * SCALP_BREAKOUT_BUFFER_ATR
+
+    previous_high = float(m15["previous_recent_high"])
+    previous_low = float(m15["previous_recent_low"])
+
+    if direction == "BUY":
+        level = previous_high + buffer_value
+        ok = close > level
+        if ok:
+            return True, f"breakout M15 BUY confermato sopra {level:.2f}"
+        return False, f"manca breakout M15 BUY: serve chiusura > {level:.2f}"
+
+    level = previous_low - buffer_value
+    ok = close < level
+    if ok:
+        return True, f"breakout M15 SELL confermato sotto {level:.2f}"
+    return False, f"manca breakout M15 SELL: serve chiusura < {level:.2f}"
+
+
+def calculate_scalp_stop_distance(
+    direction: str,
+    entry: float,
+    m15: dict,
+    m5: dict,
+) -> float:
+    """
+    Stop non piu' basato solo su ATR M5.
+    Usa il valore PIU' LARGO tra:
+    - ATR M5
+    - ATR M15
+    - struttura recente M5
+    - distanza minima percentuale
+    """
+    m5_atr = float(m5["atr"])
+    m15_atr = float(m15["atr"])
+
+    atr_distance = max(
+        m5_atr * SCALP_STOP_ATR_MULTIPLE,
+        m15_atr * SCALP_M15_STOP_ATR_MULTIPLE,
+    )
+
+    min_percent_distance = entry * SCALP_MIN_STOP_PERCENT / 100
+
+    if direction == "BUY":
+        structure_stop = (
+            float(m5["previous_recent_low"])
+            - m5_atr * SCALP_STRUCTURE_BUFFER_ATR
+        )
+        structure_distance = max(entry - structure_stop, 0.0)
+    else:
+        structure_stop = (
+            float(m5["previous_recent_high"])
+            + m5_atr * SCALP_STRUCTURE_BUFFER_ATR
+        )
+        structure_distance = max(structure_stop - entry, 0.0)
+
+    return max(
+        atr_distance,
+        min_percent_distance,
+        structure_distance,
+    )
+
+
+def build_scalp_plan(direction: str, m15: dict, m5: dict) -> dict:
+    broker = active_broker_profile()
+    entry = float(m5["price"])
+
+    stop_distance = calculate_scalp_stop_distance(
+        direction,
+        entry,
+        m15,
+        m5,
+    )
+
+    if direction == "BUY":
+        stop = entry - stop_distance
+        tp1 = entry + stop_distance * SCALP_TP1_R
+        tp2 = entry + stop_distance * SCALP_TP2_R
+    else:
+        stop = entry + stop_distance
+        tp1 = entry - stop_distance * SCALP_TP1_R
+        tp2 = entry - stop_distance * SCALP_TP2_R
+
+    capital = float(broker["capital_eur"])
+    target_risk = capital * SCALP_RISK_PERCENT / 100
+    eur_loss_per_lot = stop_distance * EUR_PER_USD_MOVE_PER_LOT
+    raw_lot = (
+        target_risk / eur_loss_per_lot
+        if eur_loss_per_lot > 0
+        else 0.0
+    )
+
+    lot = floor_to_step(raw_lot, float(broker["lot_step"]))
+    if lot < float(broker["min_lot"]):
+        lot = float(broker["min_lot"])
+    lot = min(lot, float(broker["max_lot"]))
+
+    estimated_loss = stop_distance * lot * EUR_PER_USD_MOVE_PER_LOT
+    margin = estimate_margin_eur(entry, lot, broker)
+    executable, remaining = is_trade_executable(margin, broker)
+
+    return {
+        "broker_name": str(broker["name"]),
+        "capital": capital,
+        "entry": entry,
+        "stop": stop,
+        "stop_distance": stop_distance,
+        "tp1": tp1,
+        "tp2": tp2,
+        "lot": lot,
+        "loss_eur": estimated_loss,
+        "margin_eur": margin,
+        "remaining_eur": remaining,
+        "executable": executable,
+        "raw_lot": raw_lot,
+    }
+
+
+def scalp_room_ok(
+    direction: str,
+    plan: dict,
+    h1: dict,
+) -> tuple[bool, str]:
+    """
+    Evita BUY subito sotto resistenza H1 e SELL subito sopra supporto H1.
+    La barriera deve lasciare almeno SCALP_MIN_ROOM_R volte il rischio.
+    """
+    entry = float(plan["entry"])
+    risk_distance = float(plan["stop_distance"])
+    minimum_room = risk_distance * SCALP_MIN_ROOM_R
+
+    if direction == "BUY":
+        resistance = float(h1["previous_recent_high"])
+
+        # Se la resistenza e' gia' sotto il prezzo, e' stata superata.
+        if resistance <= entry:
+            return True, "resistenza H1 gia' superata"
+
+        room = resistance - entry
+        if room >= minimum_room:
+            return True, f"spazio libero fino a resistenza H1: {room:.2f} USD"
+
+        return (
+            False,
+            f"BUY bloccato: resistenza H1 troppo vicina "
+            f"({room:.2f} USD, minimo {minimum_room:.2f})",
+        )
+
+    support = float(h1["previous_recent_low"])
+
+    if support >= entry:
+        return True, "supporto H1 gia' superato"
+
+    room = entry - support
+    if room >= minimum_room:
+        return True, f"spazio libero fino a supporto H1: {room:.2f} USD"
+
+    return (
+        False,
+        f"SELL bloccato: supporto H1 troppo vicino "
+        f"({room:.2f} USD, minimo {minimum_room:.2f})",
+    )
 
 
 def update_scalp_confirmation(
@@ -1818,6 +2000,7 @@ def update_scalp_confirmation(
     global scalp_candidate_last_m5_time
 
     bar_time = int(m5["last_candle_time"])
+
     if not eligible:
         scalp_candidate_direction = None
         scalp_candidate_count = 0
@@ -1844,6 +2027,7 @@ def scalp_signal_allowed_now() -> tuple[bool, str]:
 
     now = datetime.now(timezone.utc)
     day_key = now.strftime("%Y-%m-%d")
+
     if scalp_signal_day != day_key:
         scalp_signal_day = day_key
         scalp_signals_today = 0
@@ -1859,66 +2043,25 @@ def scalp_signal_allowed_now() -> tuple[bool, str]:
     return True, "ok"
 
 
-def build_scalp_plan(direction: str, m5: dict) -> dict:
-    broker = active_broker_profile()
-    entry = float(m5["price"])
-    atr = float(m5["atr"])
-    stop_distance = max(atr * SCALP_STOP_ATR_MULTIPLE, entry * 0.0015)
-
-    if direction == "BUY":
-        stop = entry - stop_distance
-        tp1 = entry + stop_distance * SCALP_TP1_R
-        tp2 = entry + stop_distance * SCALP_TP2_R
-    else:
-        stop = entry + stop_distance
-        tp1 = entry - stop_distance * SCALP_TP1_R
-        tp2 = entry - stop_distance * SCALP_TP2_R
-
-    capital = float(broker["capital_eur"])
-    target_risk = capital * SCALP_RISK_PERCENT / 100
-    eur_loss_per_lot = stop_distance * EUR_PER_USD_MOVE_PER_LOT
-    raw_lot = target_risk / eur_loss_per_lot if eur_loss_per_lot > 0 else 0.0
-
-    lot = floor_to_step(raw_lot, float(broker["lot_step"]))
-    if lot < float(broker["min_lot"]):
-        lot = float(broker["min_lot"])
-    lot = min(lot, float(broker["max_lot"]))
-
-    estimated_loss = stop_distance * lot * EUR_PER_USD_MOVE_PER_LOT
-    margin = estimate_margin_eur(entry, lot, broker)
-    executable, remaining = is_trade_executable(margin, broker)
-
-    return {
-        "broker_name": str(broker["name"]),
-        "capital": capital,
-        "entry": entry,
-        "stop": stop,
-        "tp1": tp1,
-        "tp2": tp2,
-        "lot": lot,
-        "loss_eur": estimated_loss,
-        "margin_eur": margin,
-        "remaining_eur": remaining,
-        "executable": executable,
-    }
-
-
 def build_scalp_green_message(
     direction: str,
     score: int,
     quality: int,
     plan: dict,
     reasons: list[str],
+    breakout_reason: str,
+    room_reason: str,
 ) -> str:
     executable_text = "SI" if bool(plan["executable"]) else "NO"
 
+    all_reasons = reasons + [breakout_reason, room_reason]
     reasons_block = "\n".join(
         f"- {reason}"
-        for reason in reasons
+        for reason in all_reasons
     )
 
     return (
-        f"[{direction} SCALP - INGRESSO] BTC Trend AI v0.9.3\n\n"
+        f"[{direction} SCALP - INGRESSO] BTC Trend AI v0.9.4\n\n"
         f"SCALP {direction} - INGRESSO CONFERMATO\n"
         "Durata obiettivo: 15-60 minuti\n\n"
         f"Broker operativo: {plan['broker_name']}\n"
@@ -1926,6 +2069,7 @@ def build_scalp_green_message(
         f"{float(plan['lot']):.2f} lotti: {executable_text}\n\n"
         f"Entrata: {float(plan['entry']):.2f}\n"
         f"Stop Loss: {float(plan['stop']):.2f}\n"
+        f"Distanza Stop: {float(plan['stop_distance']):.2f} USD\n"
         f"Take Profit 1: {float(plan['tp1']):.2f}\n"
         f"Take Profit 2: {float(plan['tp2']):.2f}\n\n"
         f"Volume: {float(plan['lot']):.2f} lotti\n"
@@ -1933,12 +2077,16 @@ def build_scalp_green_message(
         f"-{float(plan['loss_eur']):.2f} EUR\n"
         f"Margine richiesto stimato: "
         f"{float(plan['margin_eur']):.2f} EUR\n\n"
+        f"R/R TP1: 1:{SCALP_TP1_R:.2f}\n"
+        f"R/R TP2: 1:{SCALP_TP2_R:.2f}\n\n"
         f"Affidabilita' scalp: {score}/100\n"
         f"Qualita' mercato: {quality}/100\n\n"
         "AZIONE:\n"
         "VALUTARE INGRESSO SCALP ORA\n\n"
         "Conferme:\n"
         f"{reasons_block}\n\n"
+        "Il segnale viene emesso solo dopo breakout M15 chiuso "
+        "e due conferme M5.\n"
         "Non aggiungere size e non inseguire il prezzo.\n"
         "Segnale tecnico indicativo: non garantisce profitto."
     )
@@ -1953,6 +2101,7 @@ async def evaluate_and_notify_scalp(
     global scalp_last_signal_time
     global scalp_signals_today
     global last_scalp_status_key
+    global active_scalp_setup
 
     if not SCALP_ENABLED:
         return
@@ -1962,21 +2111,47 @@ async def evaluate_and_notify_scalp(
     trigger = scalp_trigger_ok(direction, m15, m5)
     blocked = scalp_h1_blocked(direction, h1)
 
+    breakout_ok, breakout_reason = scalp_breakout_ok(
+        direction,
+        m15,
+    )
+
+    # Il piano viene costruito PRIMA della conferma, per poter verificare
+    # stop dinamico e spazio reale verso supporto/resistenza.
+    plan = build_scalp_plan(direction, m15, m5)
+
+    room_ok, room_reason = scalp_room_ok(
+        direction,
+        plan,
+        h1,
+    )
+
     eligible = (
         score >= SCALP_GREEN_MIN_SCORE
         and quality >= SCALP_MIN_QUALITY
         and trigger
         and not blocked
+        and breakout_ok
+        and room_ok
     )
 
-    confirmed = update_scalp_confirmation(direction, eligible, m5)
+    confirmed = update_scalp_confirmation(
+        direction,
+        eligible,
+        m5,
+    )
 
     print(
-        "\\nSCALP v0.9.3 | "
+        "\nSCALP v0.9.4 | "
         f"{direction} score={score}/100 quality={quality}/100 "
         f"trigger={'SI' if trigger else 'NO'} "
         f"H1_block={'SI' if blocked else 'NO'} "
-        f"conferme={scalp_candidate_count}/{SCALP_CONFIRM_BARS}",
+        f"breakout={'SI' if breakout_ok else 'NO'} "
+        f"room={'SI' if room_ok else 'NO'} "
+        f"SLdist={float(plan['stop_distance']):.2f} "
+        f"conferme={scalp_candidate_count}/{SCALP_CONFIRM_BARS}\n"
+        f"Breakout: {breakout_reason}\n"
+        f"Spazio: {room_reason}",
         flush=True,
     )
 
@@ -1988,7 +2163,6 @@ async def evaluate_and_notify_scalp(
         print(f"SCALP non inviato: {reason}", flush=True)
         return
 
-    plan = build_scalp_plan(direction, m5)
     if not bool(plan["executable"]):
         print(
             "SCALP confermato tecnicamente ma non eseguibile per margine.",
@@ -1996,19 +2170,27 @@ async def evaluate_and_notify_scalp(
         )
         return
 
-    # Una sola notifica per la stessa candela M5/direzione.
     status_key = f"{direction}|{int(m5['last_candle_time'])}"
     if status_key == last_scalp_status_key:
         return
-    global active_scalp_setup
 
     if active_scalp_setup is not None:
-        print("SCALP non inviato: esiste gia' uno scalp attivo.", flush=True)
+        print(
+            "SCALP non inviato: esiste gia' uno scalp attivo.",
+            flush=True,
+        )
         return
 
     message = build_scalp_green_message(
-        direction, score, quality, plan, reasons
+        direction,
+        score,
+        quality,
+        plan,
+        reasons,
+        breakout_reason,
+        room_reason,
     )
+
     await bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
         text=message,
@@ -2028,15 +2210,19 @@ async def evaluate_and_notify_scalp(
         "quality": quality,
         "entry": float(plan["entry"]),
         "stop": float(plan["stop"]),
+        "stop_distance": float(plan["stop_distance"]),
         "tp1": float(plan["tp1"]),
         "tp2": float(plan["tp2"]),
         "lot": float(plan["lot"]),
         "broker": str(plan["broker_name"]),
+        "breakout": breakout_reason,
+        "room": room_reason,
     })
 
     last_scalp_status_key = status_key
     scalp_last_signal_time = datetime.now(timezone.utc)
     scalp_signals_today += 1
+
     print(
         f"SCALP VERDE inviato: {direction} | "
         f"{scalp_signals_today}/{SCALP_MAX_SIGNALS_PER_DAY} oggi",
@@ -2054,6 +2240,7 @@ async def run_analysis(
 ) -> None:
     global active_setup
     global last_notified_state
+    global active_scalp_setup
 
     h1_history = await fetch_candles(
         session=session,
@@ -2085,8 +2272,6 @@ async def run_analysis(
     m15 = analyze_timeframe(m15_history[-220:], "M15")
     m5 = analyze_timeframe(m5_history[-220:], "M5")
 
-    global active_scalp_setup
-
     if active_scalp_setup is not None:
         _event_key, scalp_message, close_scalp = manage_active_scalp_setup(
             active_scalp_setup,
@@ -2102,9 +2287,13 @@ async def run_analysis(
         if close_scalp:
             active_scalp_setup = None
 
-    # Cerca un nuovo scalp solo quando non ne esiste gia' uno in monitoraggio.
     if active_scalp_setup is None:
-        await evaluate_and_notify_scalp(bot, h1, m15, m5)
+        await evaluate_and_notify_scalp(
+            bot,
+            h1,
+            m15,
+            m5,
+        )
 
     (
         direction,
@@ -2123,7 +2312,7 @@ async def run_analysis(
 
     print(
         "\n"
-        f"{now} DEBUG v0.9.3 TREND\n"
+        f"{now} DEBUG v0.9.4 TREND\n"
         f"Direzione: {direction}\n"
         f"Score: {score}/100 "
         f"(H4={score_parts.get('H4', 0)}, "
@@ -2161,10 +2350,7 @@ async def run_analysis(
             m15,
         )
 
-        if (
-            management_key is not None
-            and management_message is not None
-        ):
+        if management_key is not None and management_message is not None:
             print(
                 f"\n{management_message}",
                 flush=True,
@@ -2247,14 +2433,15 @@ async def run_analysis(
         if sent:
             print(
                 "SETUP ATTIVO creato: "
-                f"{direction} @ {float(plan['entry']):.2f} su {plan['broker_name']}",
+                f"{direction} @ {float(plan['entry']):.2f} "
+                f"su {plan['broker_name']}",
                 flush=True,
             )
 
 
 async def main() -> None:
     print(
-        "BTC Trend AI v0.9.3 DUAL Trend+Scalp Multi-Broker avviato",
+        "BTC Trend AI v0.9.4 DUAL Trend+Scalp Multi-Broker avviato",
         flush=True,
     )
 
@@ -2265,7 +2452,7 @@ async def main() -> None:
         raise RuntimeError("TELEGRAM_CHAT_ID mancante")
 
     headers = {
-        "User-Agent": "BTC-Trend-AI/0.9.3",
+        "User-Agent": "BTC-Trend-AI/0.9.4",
         "Accept": "application/json",
     }
 
