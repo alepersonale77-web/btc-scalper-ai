@@ -9,12 +9,13 @@ from telegram import Bot
 
 
 # ============================================================
-# BTC TREND AI v0.9.4 - DUAL: TREND / SWING + SCALP
-# MODIFICA v0.9.4:
-# - SCALP solo dopo breakout M15 confermato
-# - filtro spazio libero da supporti/resistenze H1
-# - stop scalp dinamico ATR + struttura + distanza minima %
-# - 2 conferme M5 restano obbligatorie
+# BTC TREND AI v0.9.5 - DUAL: TREND / SWING + SCALP
+# MODIFICA v0.9.5:
+# - TREND: setup eccezionale entra con 1 conferma M15 chiusa
+# - TREND: filtro anti-inseguimento sui setup eccezionali
+# - SCALP: stop massimo per evitare SL da 1000-1800 USD
+# - SCALP: filtro anti-inseguimento dopo accelerazioni verticali
+# - SCALP normale: breakout M15 + spazio H1 + 2 conferme M5
 # ============================================================
 
 PRODUCT = "BTC-USD"
@@ -46,8 +47,17 @@ GREEN_MIN_QUALITY = 65
 YELLOW_MIN_SCORE = 72
 YELLOW_MIN_QUALITY = 55
 
+# Setup TREND eccezionale:
+# quando H4/H1 sono allineati, M15 ha trigger valido e score/qualita'
+# sono molto alti, non aspettiamo obbligatoriamente 2 conferme M15.
+EXCEPTIONAL_MIN_SCORE = int(os.environ.get("EXCEPTIONAL_MIN_SCORE", "88"))
+EXCEPTIONAL_MIN_QUALITY = int(os.environ.get("EXCEPTIONAL_MIN_QUALITY", "85"))
+EXCEPTIONAL_MAX_M15_EXTENSION_ATR = float(
+    os.environ.get("EXCEPTIONAL_MAX_M15_EXTENSION_ATR", "1.05")
+)
+
 # =========================
-# MODALITA' SCALP v0.9.4
+# MODALITA' SCALP v0.9.5
 # =========================
 SCALP_ENABLED = os.environ.get("SCALP_ENABLED", "1") == "1"
 SCALP_GREEN_MIN_SCORE = int(os.environ.get("SCALP_GREEN_MIN_SCORE", "78"))
@@ -67,6 +77,21 @@ SCALP_STRUCTURE_BUFFER_ATR = float(
 )
 SCALP_MIN_STOP_PERCENT = float(
     os.environ.get("SCALP_MIN_STOP_PERCENT", "0.25")
+)
+
+# Limite massimo per uno scalp: se la struttura richiede uno stop piu' largo,
+# il setup viene rifiutato invece di trasformarsi in un quasi-swing.
+SCALP_MAX_STOP_USD = float(
+    os.environ.get("SCALP_MAX_STOP_USD", "700")
+)
+SCALP_MAX_STOP_PERCENT = float(
+    os.environ.get("SCALP_MAX_STOP_PERCENT", "0.90")
+)
+
+# Anti-inseguimento: niente nuovo scalp se M15 e' gia' troppo esteso
+# rispetto alla EMA50. Dopo un pullback il setup puo' tornare valido.
+SCALP_MAX_M15_EXTENSION_ATR = float(
+    os.environ.get("SCALP_MAX_M15_EXTENSION_ATR", "1.35")
 )
 
 # Target scalp
@@ -847,7 +872,45 @@ def determine_state(
 ) -> tuple[str, str]:
     aligned = higher_timeframes_aligned(direction, h4, h1)
     trigger_ok = m15_trigger_ok(direction, m15)
+    extension = float(m15["distance_from_ema50_atr"])
 
+    # ---------------------------------------------------------
+    # v0.9.5 - SETUP ECCEZIONALE
+    # ---------------------------------------------------------
+    # La candela M15 usata dal bot e' gia' una candela CHIUSA.
+    # Se trend, score e qualita' sono eccezionali, una sola
+    # conferma M15 e' sufficiente: non aspettiamo altre 2 barre
+    # rischiando di entrare centinaia/migliaia di dollari dopo.
+    exceptional_candidate = (
+        score >= EXCEPTIONAL_MIN_SCORE
+        and quality >= EXCEPTIONAL_MIN_QUALITY
+        and aligned
+        and trigger_ok
+    )
+
+    if exceptional_candidate:
+        if extension <= EXCEPTIONAL_MAX_M15_EXTENSION_ATR:
+            # reset della persistenza normale: questo e' un canale separato
+            global green_candidate_direction
+            global green_candidate_count
+            global green_candidate_last_m15_time
+            green_candidate_direction = None
+            green_candidate_count = 0
+            green_candidate_last_m15_time = int(m15["last_candle_time"])
+
+            return (
+                "VERDE",
+                "SETUP ECCEZIONALE - VALUTA INGRESSO ANTICIPATO",
+            )
+
+        return (
+            "GIALLO",
+            "SETUP FORTE MA PREZZO ESTESO - ATTENDERE PULLBACK",
+        )
+
+    # ---------------------------------------------------------
+    # Setup normale: conserva le 2 conferme M15.
+    # ---------------------------------------------------------
     green_candidate = (
         score >= GREEN_MIN_SCORE
         and quality >= GREEN_MIN_QUALITY
@@ -870,9 +933,7 @@ def determine_state(
             f"CONFERMA {confirm_count}/{GREEN_CONFIRM_BARS} - ATTENDERE",
         )
 
-    too_extended = (
-        float(m15["distance_from_ema50_atr"]) > 1.20
-    )
+    too_extended = extension > 1.20
 
     if (
         score >= YELLOW_MIN_SCORE
@@ -1135,7 +1196,7 @@ def build_telegram_message(
 
     if state == "ROSSO":
         return (
-            "[NO TRADE - TREND] BTC Trend AI v0.9.4\n\n"
+            "[NO TRADE - TREND] BTC Trend AI v0.9.5\n\n"
             "NESSUN SETUP OPERATIVO\n\n"
             f"Broker operativo: {broker_name}\n"
             f"Trend di fondo H4/H1: {trend_background}\n"
@@ -1169,7 +1230,7 @@ def build_telegram_message(
 
     if state == "GIALLO":
         return (
-            "[PREALLERTA - TREND] BTC Trend AI v0.9.4\n\n"
+            "[PREALLERTA - TREND] BTC Trend AI v0.9.5\n\n"
             f"{setup_label(state, score, quality)}\n\n"
             "STATO: PREALLERTA - NON ENTRARE\n\n"
             f"Broker operativo: {broker_name}\n"
@@ -1204,7 +1265,7 @@ def build_telegram_message(
     )
 
     return (
-        "[SETUP CONFERMATO - TREND] BTC Trend AI v0.9.4\n\n"
+        "[SETUP CONFERMATO - TREND] BTC Trend AI v0.9.5\n\n"
         f"{setup_label(state, score, quality)}\n"
         f"{authorization}\n\n"
         f"Broker operativo: {broker_name}\n"
@@ -1254,7 +1315,7 @@ def build_active_setup_message(
     if current_price is not None:
         price_line = f"Prezzo attuale: {current_price:.2f}\n"
     return (
-        f"{title} BTC Trend AI v0.9.4\n\n"
+        f"{title} BTC Trend AI v0.9.5\n\n"
         f"{setup['direction']} - POSIZIONE IN MONITORAGGIO\n"
         f"Broker: {setup.get('broker_name', 'N/D')}\n\n"
         f"Entrata originale: {float(setup['entry']):.2f}\n"
@@ -1524,7 +1585,7 @@ def build_scalp_management_message(
     action: str,
 ) -> str:
     return (
-        f"{title} BTC Trend AI v0.9.4\n\n"
+        f"{title} BTC Trend AI v0.9.5\n\n"
         f"SCALP {setup['direction']} - POSIZIONE IN MONITORAGGIO\n"
         f"Broker: {setup['broker_name']}\n\n"
         f"Entrata: {float(setup['entry']):.2f}\n"
@@ -1683,7 +1744,7 @@ def manage_active_scalp_setup(
 
 
 # =========================
-# MOTORE SCALP v0.9.4
+# MOTORE SCALP v0.9.5
 # =========================
 
 def scalp_direction_score(
@@ -1889,6 +1950,68 @@ def calculate_scalp_stop_distance(
     )
 
 
+def scalp_stop_ok(
+    entry: float,
+    stop_distance: float,
+) -> tuple[bool, str]:
+    """
+    Uno scalp 15-60 min non deve avere uno stop da swing.
+    Il limite effettivo e' il PIU' BASSO tra:
+    - SCALP_MAX_STOP_USD
+    - percentuale massima del prezzo
+    """
+    percent_cap = entry * SCALP_MAX_STOP_PERCENT / 100
+    max_allowed = min(SCALP_MAX_STOP_USD, percent_cap)
+
+    if stop_distance <= max_allowed:
+        return (
+            True,
+            f"stop scalp valido: {stop_distance:.2f} USD "
+            f"(max {max_allowed:.2f})",
+        )
+
+    return (
+        False,
+        f"stop troppo largo per scalp: {stop_distance:.2f} USD "
+        f"(max {max_allowed:.2f})",
+    )
+
+
+def scalp_not_chasing(
+    direction: str,
+    m15: dict,
+    m5: dict,
+) -> tuple[bool, str]:
+    """
+    Blocca il nuovo ingresso quando l'impulso e' gia' troppo lontano
+    dalla EMA50 M15. Non e' un blocco permanente: dopo il pullback,
+    la distanza ATR scende e il setup torna valutabile.
+    """
+    extension = float(m15["distance_from_ema50_atr"])
+
+    if extension > SCALP_MAX_M15_EXTENSION_ATR:
+        return (
+            False,
+            f"prezzo troppo esteso: {extension:.2f} ATR da EMA50 M15 "
+            f"(max {SCALP_MAX_M15_EXTENSION_ATR:.2f}) - attendere pullback",
+        )
+
+    # Evita anche la candela M5 eccessivamente verticale:
+    # un corpo > 1.8 ATR M5 indica spesso ingresso tardivo.
+    m5_atr = float(m5["atr"])
+    body = abs(float(m5["last_close"]) - float(m5["last_open"]))
+    body_atr = body / m5_atr if m5_atr > 0 else 0.0
+
+    if body_atr > 1.80:
+        return (
+            False,
+            f"candela M5 troppo estesa: corpo {body_atr:.2f} ATR - "
+            "attendere pullback/nuovo trigger",
+        )
+
+    return True, f"estensione accettabile: {extension:.2f} ATR"
+
+
 def build_scalp_plan(direction: str, m15: dict, m5: dict) -> dict:
     broker = active_broker_profile()
     entry = float(m5["price"])
@@ -2051,17 +2174,19 @@ def build_scalp_green_message(
     reasons: list[str],
     breakout_reason: str,
     room_reason: str,
+    stop_reason: str,
+    chase_reason: str,
 ) -> str:
     executable_text = "SI" if bool(plan["executable"]) else "NO"
 
-    all_reasons = reasons + [breakout_reason, room_reason]
+    all_reasons = reasons + [breakout_reason, room_reason, stop_reason, chase_reason]
     reasons_block = "\n".join(
         f"- {reason}"
         for reason in all_reasons
     )
 
     return (
-        f"[{direction} SCALP - INGRESSO] BTC Trend AI v0.9.4\n\n"
+        f"[{direction} SCALP - INGRESSO] BTC Trend AI v0.9.5\n\n"
         f"SCALP {direction} - INGRESSO CONFERMATO\n"
         "Durata obiettivo: 15-60 minuti\n\n"
         f"Broker operativo: {plan['broker_name']}\n"
@@ -2085,8 +2210,8 @@ def build_scalp_green_message(
         "VALUTARE INGRESSO SCALP ORA\n\n"
         "Conferme:\n"
         f"{reasons_block}\n\n"
-        "Il segnale viene emesso solo dopo breakout M15 chiuso "
-        "e due conferme M5.\n"
+        "Il segnale scalp normale richiede breakout M15 chiuso, "
+        "due conferme M5, stop entro il limite e prezzo non esteso.\n"
         "Non aggiungere size e non inseguire il prezzo.\n"
         "Segnale tecnico indicativo: non garantisce profitto."
     )
@@ -2126,6 +2251,17 @@ async def evaluate_and_notify_scalp(
         h1,
     )
 
+    stop_ok, stop_reason = scalp_stop_ok(
+        float(plan["entry"]),
+        float(plan["stop_distance"]),
+    )
+
+    chase_ok, chase_reason = scalp_not_chasing(
+        direction,
+        m15,
+        m5,
+    )
+
     eligible = (
         score >= SCALP_GREEN_MIN_SCORE
         and quality >= SCALP_MIN_QUALITY
@@ -2133,6 +2269,8 @@ async def evaluate_and_notify_scalp(
         and not blocked
         and breakout_ok
         and room_ok
+        and stop_ok
+        and chase_ok
     )
 
     confirmed = update_scalp_confirmation(
@@ -2142,16 +2280,20 @@ async def evaluate_and_notify_scalp(
     )
 
     print(
-        "\nSCALP v0.9.4 | "
+        "\nSCALP v0.9.5 | "
         f"{direction} score={score}/100 quality={quality}/100 "
         f"trigger={'SI' if trigger else 'NO'} "
         f"H1_block={'SI' if blocked else 'NO'} "
         f"breakout={'SI' if breakout_ok else 'NO'} "
         f"room={'SI' if room_ok else 'NO'} "
+        f"stop_ok={'SI' if stop_ok else 'NO'} "
+        f"chase_ok={'SI' if chase_ok else 'NO'} "
         f"SLdist={float(plan['stop_distance']):.2f} "
         f"conferme={scalp_candidate_count}/{SCALP_CONFIRM_BARS}\n"
         f"Breakout: {breakout_reason}\n"
-        f"Spazio: {room_reason}",
+        f"Spazio: {room_reason}\n"
+        f"Stop: {stop_reason}\n"
+        f"Anti-chase: {chase_reason}",
         flush=True,
     )
 
@@ -2189,6 +2331,8 @@ async def evaluate_and_notify_scalp(
         reasons,
         breakout_reason,
         room_reason,
+        stop_reason,
+        chase_reason,
     )
 
     await bot.send_message(
@@ -2312,7 +2456,7 @@ async def run_analysis(
 
     print(
         "\n"
-        f"{now} DEBUG v0.9.4 TREND\n"
+        f"{now} DEBUG v0.9.5 TREND\n"
         f"Direzione: {direction}\n"
         f"Score: {score}/100 "
         f"(H4={score_parts.get('H4', 0)}, "
@@ -2441,7 +2585,7 @@ async def run_analysis(
 
 async def main() -> None:
     print(
-        "BTC Trend AI v0.9.4 DUAL Trend+Scalp Multi-Broker avviato",
+        "BTC Trend AI v0.9.5 DUAL Trend+Scalp Multi-Broker avviato",
         flush=True,
     )
 
