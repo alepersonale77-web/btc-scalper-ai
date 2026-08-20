@@ -9,13 +9,16 @@ from telegram import Bot
 
 
 # ============================================================
-# BTC TREND AI v0.9.5 - DUAL: TREND / SWING + SCALP
-# MODIFICA v0.9.5:
-# - TREND: setup eccezionale entra con 1 conferma M15 chiusa
-# - TREND: filtro anti-inseguimento sui setup eccezionali
-# - SCALP: stop massimo per evitare SL da 1000-1800 USD
-# - SCALP: filtro anti-inseguimento dopo accelerazioni verticali
-# - SCALP normale: breakout M15 + spazio H1 + 2 conferme M5
+# BTC TREND AI v0.9.7 - DUAL: TREND / SWING + SCALP
+# CONFIGURAZIONE FUTURA:
+# - FP Markets capitale predefinito: 475 EUR
+# - rischio reale massimo per singolo setup: 6%
+# - nessun calcolo sulle posizioni manuali gia' aperte
+# MODIFICA v0.9.7:
+# - TREND: canale anticipato anche con score 85-87 se qualita' >= 90
+# - TREND: setup eccezionale 88+ resta prioritario
+# - TREND/SCALP: blocco se il rischio reale della size minima e' eccessivo
+# - TREND/SCALP: filtri anti-inseguimento e stop massimo restano attivi
 # ============================================================
 
 PRODUCT = "BTC-USD"
@@ -27,7 +30,7 @@ RSI_PERIOD = 14
 ATR_PERIOD = 14
 ADX_PERIOD = 14
 
-ACCOUNT_CAPITAL_EUR = float(os.environ.get("ACCOUNT_CAPITAL_EUR", "115"))
+ACCOUNT_CAPITAL_EUR = float(os.environ.get("ACCOUNT_CAPITAL_EUR", "475"))
 FULL_RISK_PERCENT = float(os.environ.get("FULL_RISK_PERCENT", "1.0"))
 YELLOW_RISK_FRACTION = float(os.environ.get("YELLOW_RISK_FRACTION", "0.25"))
 
@@ -56,8 +59,19 @@ EXCEPTIONAL_MAX_M15_EXTENSION_ATR = float(
     os.environ.get("EXCEPTIONAL_MAX_M15_EXTENSION_ATR", "1.05")
 )
 
+EARLY_ENTRY_MIN_SCORE = int(os.environ.get("EARLY_ENTRY_MIN_SCORE", "85"))
+EARLY_ENTRY_MAX_SCORE = int(os.environ.get("EARLY_ENTRY_MAX_SCORE", "87"))
+EARLY_ENTRY_MIN_QUALITY = int(os.environ.get("EARLY_ENTRY_MIN_QUALITY", "90"))
+EARLY_ENTRY_MAX_M15_EXTENSION_ATR = float(
+    os.environ.get("EARLY_ENTRY_MAX_M15_EXTENSION_ATR", "0.90")
+)
+
+MAX_REAL_RISK_PERCENT = float(
+    os.environ.get("MAX_REAL_RISK_PERCENT", "6.0")
+)
+
 # =========================
-# MODALITA' SCALP v0.9.5
+# MODALITA' SCALP v0.9.7
 # =========================
 SCALP_ENABLED = os.environ.get("SCALP_ENABLED", "1") == "1"
 SCALP_GREEN_MIN_SCORE = int(os.environ.get("SCALP_GREEN_MIN_SCORE", "78"))
@@ -146,7 +160,7 @@ PEPPER_MARGIN_EUR_PER_LOT = float(
 )
 
 FP_ACCOUNT_CAPITAL_EUR = float(
-    os.environ.get("FP_ACCOUNT_CAPITAL_EUR", "115")
+    os.environ.get("FP_ACCOUNT_CAPITAL_EUR", "475")
 )
 PEPPER_ACCOUNT_CAPITAL_EUR = float(
     os.environ.get("PEPPER_ACCOUNT_CAPITAL_EUR", "500")
@@ -874,13 +888,6 @@ def determine_state(
     trigger_ok = m15_trigger_ok(direction, m15)
     extension = float(m15["distance_from_ema50_atr"])
 
-    # ---------------------------------------------------------
-    # v0.9.5 - SETUP ECCEZIONALE
-    # ---------------------------------------------------------
-    # La candela M15 usata dal bot e' gia' una candela CHIUSA.
-    # Se trend, score e qualita' sono eccezionali, una sola
-    # conferma M15 e' sufficiente: non aspettiamo altre 2 barre
-    # rischiando di entrare centinaia/migliaia di dollari dopo.
     exceptional_candidate = (
         score >= EXCEPTIONAL_MIN_SCORE
         and quality >= EXCEPTIONAL_MIN_QUALITY
@@ -890,7 +897,6 @@ def determine_state(
 
     if exceptional_candidate:
         if extension <= EXCEPTIONAL_MAX_M15_EXTENSION_ATR:
-            # reset della persistenza normale: questo e' un canale separato
             global green_candidate_direction
             global green_candidate_count
             global green_candidate_last_m15_time
@@ -905,12 +911,32 @@ def determine_state(
 
         return (
             "GIALLO",
+            "SETUP ECCEZIONALE MA PREZZO ESTESO - ATTENDERE PULLBACK",
+        )
+
+    early_candidate = (
+        EARLY_ENTRY_MIN_SCORE <= score <= EARLY_ENTRY_MAX_SCORE
+        and quality >= EARLY_ENTRY_MIN_QUALITY
+        and aligned
+        and trigger_ok
+    )
+
+    if early_candidate:
+        if extension <= EARLY_ENTRY_MAX_M15_EXTENSION_ATR:
+            green_candidate_direction = None
+            green_candidate_count = 0
+            green_candidate_last_m15_time = int(m15["last_candle_time"])
+
+            return (
+                "VERDE",
+                "SETUP FORTE - INGRESSO ANTICIPATO CON RISCHIO CONTROLLATO",
+            )
+
+        return (
+            "GIALLO",
             "SETUP FORTE MA PREZZO ESTESO - ATTENDERE PULLBACK",
         )
 
-    # ---------------------------------------------------------
-    # Setup normale: conserva le 2 conferme M15.
-    # ---------------------------------------------------------
     green_candidate = (
         score >= GREEN_MIN_SCORE
         and quality >= GREEN_MIN_QUALITY
@@ -1123,9 +1149,17 @@ def build_trade_plan(
     tp1_profit_eur = actual_risk_eur * TP1_R_MULTIPLE
     tp2_profit_eur = actual_risk_eur * TP2_R_MULTIPLE
     estimated_margin_eur = estimate_margin_eur(entry, lot_size, broker)
-    executable, remaining_after_margin = is_trade_executable(
+    margin_executable, remaining_after_margin = is_trade_executable(
         estimated_margin_eur, broker
     )
+
+    max_real_risk_eur = broker_capital * MAX_REAL_RISK_PERCENT / 100
+    risk_executable = (
+        actual_risk_eur <= max_real_risk_eur
+        if lot_size > 0
+        else True
+    )
+    executable = margin_executable and risk_executable
 
     return {
         "broker_name": str(broker["name"]),
@@ -1145,6 +1179,9 @@ def build_trade_plan(
         "estimated_margin_eur": estimated_margin_eur,
         "remaining_after_margin_eur": remaining_after_margin,
         "trade_executable": executable,
+        "margin_executable": margin_executable,
+        "risk_executable": risk_executable,
+        "max_real_risk_eur": max_real_risk_eur,
         "raw_lot_size": raw_lot_size,
         "lot_cap": lot_cap,
         "minimum_warning": minimum_warning,
@@ -1196,7 +1233,7 @@ def build_telegram_message(
 
     if state == "ROSSO":
         return (
-            "[NO TRADE - TREND] BTC Trend AI v0.9.5\n\n"
+            "[NO TRADE - TREND] BTC Trend AI v0.9.7\n\n"
             "NESSUN SETUP OPERATIVO\n\n"
             f"Broker operativo: {broker_name}\n"
             f"Trend di fondo H4/H1: {trend_background}\n"
@@ -1221,16 +1258,24 @@ def build_telegram_message(
             f"{lot_size:.2f} lotti puo' essere diverso.\n"
         )
 
-    if not executable:
+    if not bool(plan.get("margin_executable", True)):
         warning += (
             "\nATTENZIONE: capitale/margine insufficiente "
             "per eseguire questa size sul broker operativo. "
             "Non aumentare il deposito solo per forzare il trade.\n"
         )
 
+    if not bool(plan.get("risk_executable", True)):
+        warning += (
+            "\nBLOCCO RISCHIO: con la size minima il rischio reale stimato "
+            f"e' {float(plan['actual_risk_eur']):.2f} EUR, oltre il massimo "
+            f"consentito di {float(plan['max_real_risk_eur']):.2f} EUR "
+            f"({MAX_REAL_RISK_PERCENT:.1f}% del capitale). NON ENTRARE.\n"
+        )
+
     if state == "GIALLO":
         return (
-            "[PREALLERTA - TREND] BTC Trend AI v0.9.5\n\n"
+            "[PREALLERTA - TREND] BTC Trend AI v0.9.7\n\n"
             f"{setup_label(state, score, quality)}\n\n"
             "STATO: PREALLERTA - NON ENTRARE\n\n"
             f"Broker operativo: {broker_name}\n"
@@ -1265,7 +1310,7 @@ def build_telegram_message(
     )
 
     return (
-        "[SETUP CONFERMATO - TREND] BTC Trend AI v0.9.5\n\n"
+        "[SETUP CONFERMATO - TREND] BTC Trend AI v0.9.7\n\n"
         f"{setup_label(state, score, quality)}\n"
         f"{authorization}\n\n"
         f"Broker operativo: {broker_name}\n"
@@ -1315,7 +1360,7 @@ def build_active_setup_message(
     if current_price is not None:
         price_line = f"Prezzo attuale: {current_price:.2f}\n"
     return (
-        f"{title} BTC Trend AI v0.9.5\n\n"
+        f"{title} BTC Trend AI v0.9.7\n\n"
         f"{setup['direction']} - POSIZIONE IN MONITORAGGIO\n"
         f"Broker: {setup.get('broker_name', 'N/D')}\n\n"
         f"Entrata originale: {float(setup['entry']):.2f}\n"
@@ -1585,7 +1630,7 @@ def build_scalp_management_message(
     action: str,
 ) -> str:
     return (
-        f"{title} BTC Trend AI v0.9.5\n\n"
+        f"{title} BTC Trend AI v0.9.7\n\n"
         f"SCALP {setup['direction']} - POSIZIONE IN MONITORAGGIO\n"
         f"Broker: {setup['broker_name']}\n\n"
         f"Entrata: {float(setup['entry']):.2f}\n"
@@ -1744,7 +1789,7 @@ def manage_active_scalp_setup(
 
 
 # =========================
-# MOTORE SCALP v0.9.5
+# MOTORE SCALP v0.9.7
 # =========================
 
 def scalp_direction_score(
@@ -2048,7 +2093,11 @@ def build_scalp_plan(direction: str, m15: dict, m5: dict) -> dict:
 
     estimated_loss = stop_distance * lot * EUR_PER_USD_MOVE_PER_LOT
     margin = estimate_margin_eur(entry, lot, broker)
-    executable, remaining = is_trade_executable(margin, broker)
+    margin_executable, remaining = is_trade_executable(margin, broker)
+
+    max_real_risk_eur = capital * MAX_REAL_RISK_PERCENT / 100
+    risk_executable = estimated_loss <= max_real_risk_eur
+    executable = margin_executable and risk_executable
 
     return {
         "broker_name": str(broker["name"]),
@@ -2063,6 +2112,9 @@ def build_scalp_plan(direction: str, m15: dict, m5: dict) -> dict:
         "margin_eur": margin,
         "remaining_eur": remaining,
         "executable": executable,
+        "margin_executable": margin_executable,
+        "risk_executable": risk_executable,
+        "max_real_risk_eur": max_real_risk_eur,
         "raw_lot": raw_lot,
     }
 
@@ -2186,7 +2238,7 @@ def build_scalp_green_message(
     )
 
     return (
-        f"[{direction} SCALP - INGRESSO] BTC Trend AI v0.9.5\n\n"
+        f"[{direction} SCALP - INGRESSO] BTC Trend AI v0.9.7\n\n"
         f"SCALP {direction} - INGRESSO CONFERMATO\n"
         "Durata obiettivo: 15-60 minuti\n\n"
         f"Broker operativo: {plan['broker_name']}\n"
@@ -2200,6 +2252,8 @@ def build_scalp_green_message(
         f"Volume: {float(plan['lot']):.2f} lotti\n"
         f"Perdita massima stimata: "
         f"-{float(plan['loss_eur']):.2f} EUR\n"
+        f"Rischio massimo ammesso: "
+        f"{float(plan['max_real_risk_eur']):.2f} EUR\n"
         f"Margine richiesto stimato: "
         f"{float(plan['margin_eur']):.2f} EUR\n\n"
         f"R/R TP1: 1:{SCALP_TP1_R:.2f}\n"
@@ -2271,6 +2325,7 @@ async def evaluate_and_notify_scalp(
         and room_ok
         and stop_ok
         and chase_ok
+        and bool(plan["risk_executable"])
     )
 
     confirmed = update_scalp_confirmation(
@@ -2280,7 +2335,7 @@ async def evaluate_and_notify_scalp(
     )
 
     print(
-        "\nSCALP v0.9.5 | "
+        "\nSCALP v0.9.7 | "
         f"{direction} score={score}/100 quality={quality}/100 "
         f"trigger={'SI' if trigger else 'NO'} "
         f"H1_block={'SI' if blocked else 'NO'} "
@@ -2288,6 +2343,7 @@ async def evaluate_and_notify_scalp(
         f"room={'SI' if room_ok else 'NO'} "
         f"stop_ok={'SI' if stop_ok else 'NO'} "
         f"chase_ok={'SI' if chase_ok else 'NO'} "
+        f"risk_ok={'SI' if bool(plan['risk_executable']) else 'NO'} "
         f"SLdist={float(plan['stop_distance']):.2f} "
         f"conferme={scalp_candidate_count}/{SCALP_CONFIRM_BARS}\n"
         f"Breakout: {breakout_reason}\n"
@@ -2306,10 +2362,18 @@ async def evaluate_and_notify_scalp(
         return
 
     if not bool(plan["executable"]):
-        print(
-            "SCALP confermato tecnicamente ma non eseguibile per margine.",
-            flush=True,
-        )
+        if not bool(plan.get("risk_executable", True)):
+            print(
+                "SCALP bloccato: rischio reale eccessivo con size minima. "
+                f"Rischio={float(plan['loss_eur']):.2f} EUR, "
+                f"max={float(plan['max_real_risk_eur']):.2f} EUR.",
+                flush=True,
+            )
+        else:
+            print(
+                "SCALP confermato tecnicamente ma non eseguibile per margine.",
+                flush=True,
+            )
         return
 
     status_key = f"{direction}|{int(m5['last_candle_time'])}"
@@ -2456,7 +2520,7 @@ async def run_analysis(
 
     print(
         "\n"
-        f"{now} DEBUG v0.9.5 TREND\n"
+        f"{now} DEBUG v0.9.7 TREND\n"
         f"Direzione: {direction}\n"
         f"Score: {score}/100 "
         f"(H4={score_parts.get('H4', 0)}, "
@@ -2585,7 +2649,7 @@ async def run_analysis(
 
 async def main() -> None:
     print(
-        "BTC Trend AI v0.9.5 DUAL Trend+Scalp Multi-Broker avviato",
+        "BTC Trend AI v0.9.7 DUAL Trend+Scalp Multi-Broker avviato",
         flush=True,
     )
 
@@ -2596,7 +2660,7 @@ async def main() -> None:
         raise RuntimeError("TELEGRAM_CHAT_ID mancante")
 
     headers = {
-        "User-Agent": "BTC-Trend-AI/0.9.4",
+        "User-Agent": "BTC-Trend-AI/0.9.7",
         "Accept": "application/json",
     }
 
