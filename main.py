@@ -9,13 +9,18 @@ from telegram import Bot
 
 
 # ============================================================
-# BTC TREND AI v0.9.9 - DUAL: TREND / SWING + SCALP
+# BTC TREND AI v0.9.10 - DUAL: TREND / SWING + SCALP
 # CONFIGURAZIONE FUTURA:
 # - FP Markets capitale predefinito: 475 EUR
 # - rischio reale massimo per singolo setup: 6.25%
 # - nuovi ingressi separati dalla gestione posizioni gia' aperte
 # - canale TREND MOMENTUM attivo
-# MODIFICA v0.9.9:
+# MODIFICA v0.9.10:
+# - nuovo canale TREND MOMENTUM PULLBACK
+# - H4/H1 decidono il trend, M15 conferma, M5 cerca il rientro
+# - stop pullback su struttura M5/M15, senza usare sempre lo stop H1 largo
+# - se il pullback non offre uno stop tecnico valido il bot aspetta
+# - rischio massimo 6.25% invariato
 # - TREND: canale anticipato anche con score 85-87 se qualita' >= 90
 # - TREND: setup eccezionale 88+ resta prioritario
 # - TREND/SCALP: blocco se il rischio reale della size minima e' eccessivo
@@ -67,7 +72,7 @@ EARLY_ENTRY_MAX_M15_EXTENSION_ATR = float(
     os.environ.get("EARLY_ENTRY_MAX_M15_EXTENSION_ATR", "0.90")
 )
 
-# Canale TREND MOMENTUM v0.9.9
+# Canale TREND MOMENTUM v0.9.10
 MOMENTUM_MIN_SCORE = int(os.environ.get("MOMENTUM_MIN_SCORE", "82"))
 MOMENTUM_MIN_QUALITY = int(os.environ.get("MOMENTUM_MIN_QUALITY", "90"))
 MOMENTUM_MIN_H1_ADX = float(os.environ.get("MOMENTUM_MIN_H1_ADX", "24"))
@@ -79,12 +84,50 @@ MOMENTUM_PULLBACK_MAX_EXTENSION_ATR = float(
     os.environ.get("MOMENTUM_PULLBACK_MAX_EXTENSION_ATR", "0.75")
 )
 
+# =========================
+# TREND MOMENTUM PULLBACK v0.9.10
+# =========================
+TREND_PULLBACK_ENABLED = os.environ.get("TREND_PULLBACK_ENABLED", "1") == "1"
+TREND_PULLBACK_MIN_SCORE = int(
+    os.environ.get("TREND_PULLBACK_MIN_SCORE", "82")
+)
+TREND_PULLBACK_MIN_QUALITY = int(
+    os.environ.get("TREND_PULLBACK_MIN_QUALITY", "90")
+)
+TREND_PULLBACK_MAX_M15_EXTENSION_ATR = float(
+    os.environ.get("TREND_PULLBACK_MAX_M15_EXTENSION_ATR", "1.20")
+)
+TREND_PULLBACK_M5_STOP_ATR_MULTIPLE = float(
+    os.environ.get("TREND_PULLBACK_M5_STOP_ATR_MULTIPLE", "1.80")
+)
+TREND_PULLBACK_M15_STOP_ATR_MULTIPLE = float(
+    os.environ.get("TREND_PULLBACK_M15_STOP_ATR_MULTIPLE", "0.65")
+)
+TREND_PULLBACK_STRUCTURE_BUFFER_ATR = float(
+    os.environ.get("TREND_PULLBACK_STRUCTURE_BUFFER_ATR", "0.25")
+)
+TREND_PULLBACK_MIN_STOP_PERCENT = float(
+    os.environ.get("TREND_PULLBACK_MIN_STOP_PERCENT", "0.25")
+)
+TREND_PULLBACK_MAX_STOP_USD = float(
+    os.environ.get("TREND_PULLBACK_MAX_STOP_USD", "2000")
+)
+TREND_PULLBACK_MAX_STOP_PERCENT = float(
+    os.environ.get("TREND_PULLBACK_MAX_STOP_PERCENT", "2.50")
+)
+TREND_PULLBACK_TP1_R = float(
+    os.environ.get("TREND_PULLBACK_TP1_R", "1.50")
+)
+TREND_PULLBACK_TP2_R = float(
+    os.environ.get("TREND_PULLBACK_TP2_R", "2.50")
+)
+
 MAX_REAL_RISK_PERCENT = float(
     os.environ.get("MAX_REAL_RISK_PERCENT", "6.25")
 )
 
 # =========================
-# MODALITA' SCALP v0.9.9
+# MODALITA' SCALP v0.9.10
 # =========================
 SCALP_ENABLED = os.environ.get("SCALP_ENABLED", "1") == "1"
 SCALP_GREEN_MIN_SCORE = int(os.environ.get("SCALP_GREEN_MIN_SCORE", "78"))
@@ -599,7 +642,19 @@ def analyze_timeframe(
     previous_recent_low = min(float(candle[1]) for candle in previous_recent)
     previous_recent_high = max(float(candle[2]) for candle in previous_recent)
 
+    # Micro-struttura per gli ingressi pullback M5:
+    # 6 candele = circa 30 minuti su M5.
+    micro_lookback = 6
+    micro_recent = candles[-micro_lookback:]
+    micro_recent_low = min(float(candle[1]) for candle in micro_recent)
+    micro_recent_high = max(float(candle[2]) for candle in micro_recent)
+
+    micro_previous = candles[-(micro_lookback + 1):-1]
+    micro_previous_low = min(float(candle[1]) for candle in micro_previous)
+    micro_previous_high = max(float(candle[2]) for candle in micro_previous)
+
     last_candle = candles[-1]
+    previous_candle = candles[-2]
 
     return {
         "timeframe": timeframe,
@@ -617,6 +672,14 @@ def analyze_timeframe(
         "recent_high": recent_high,
         "previous_recent_low": previous_recent_low,
         "previous_recent_high": previous_recent_high,
+        "micro_recent_low": micro_recent_low,
+        "micro_recent_high": micro_recent_high,
+        "micro_previous_low": micro_previous_low,
+        "micro_previous_high": micro_previous_high,
+        "prev_low": float(previous_candle[1]),
+        "prev_high": float(previous_candle[2]),
+        "prev_open": float(previous_candle[3]),
+        "prev_close": float(previous_candle[4]),
         "last_candle_time": int(last_candle[0]),
         "last_low": float(last_candle[1]),
         "last_high": float(last_candle[2]),
@@ -1027,6 +1090,359 @@ def market_phase_label(
     return "M15 IN ATTESA DI TRIGGER"
 
 
+
+# =========================
+# TREND MOMENTUM PULLBACK v0.9.10
+# =========================
+
+def trend_pullback_context_ok(
+    direction: str,
+    score: int,
+    quality: int,
+    h4: dict,
+    h1: dict,
+    m15: dict,
+) -> tuple[bool, str]:
+    if not TREND_PULLBACK_ENABLED:
+        return False, "canale pullback disattivato"
+
+    if score < TREND_PULLBACK_MIN_SCORE:
+        return False, f"score {score} sotto {TREND_PULLBACK_MIN_SCORE}"
+
+    if quality < TREND_PULLBACK_MIN_QUALITY:
+        return False, f"qualita' {quality} sotto {TREND_PULLBACK_MIN_QUALITY}"
+
+    if not higher_timeframes_aligned(direction, h4, h1):
+        return False, "H4/H1 non allineati"
+
+    extension = float(m15["distance_from_ema50_atr"])
+    if extension > TREND_PULLBACK_MAX_M15_EXTENSION_ATR:
+        return (
+            False,
+            f"M15 ancora troppo esteso: {extension:.2f} ATR "
+            f"(max {TREND_PULLBACK_MAX_M15_EXTENSION_ATR:.2f})",
+        )
+
+    expected = "RIALZISTA" if direction == "BUY" else "RIBASSISTA"
+    if str(m15["trend"]) != expected:
+        return False, "M15 non ancora riallineato al trend"
+
+    return True, "contesto pullback valido"
+
+
+def trend_pullback_m5_trigger_ok(
+    direction: str,
+    m5: dict,
+) -> tuple[bool, str]:
+    """
+    Cerca un nuovo impulso M5 DOPO il pullback.
+    La candela usata e' gia' chiusa.
+    Non richiede breakout M15: quello sarebbe spesso troppo tardivo.
+    """
+    close = float(m5["last_close"])
+    open_ = float(m5["last_open"])
+    ema50 = float(m5["ema50"])
+    rsi = float(m5["rsi"])
+    prev_high = float(m5["prev_high"])
+    prev_low = float(m5["prev_low"])
+
+    if direction == "BUY":
+        candle_ok = close > open_
+        ema_ok = close > ema50
+        rsi_ok = 48 <= rsi <= 72
+        impulse_ok = close > prev_high
+
+        if candle_ok and ema_ok and rsi_ok and impulse_ok:
+            return True, (
+                f"M5 BUY confermato: close {close:.2f} > "
+                f"massimo precedente {prev_high:.2f}"
+            )
+
+        missing = []
+        if not candle_ok:
+            missing.append("candela M5 non rialzista")
+        if not ema_ok:
+            missing.append("close M5 sotto EMA50")
+        if not rsi_ok:
+            missing.append(f"RSI M5 {rsi:.1f} fuori range")
+        if not impulse_ok:
+            missing.append(f"serve close M5 > {prev_high:.2f}")
+        return False, ", ".join(missing)
+
+    candle_ok = close < open_
+    ema_ok = close < ema50
+    rsi_ok = 28 <= rsi <= 52
+    impulse_ok = close < prev_low
+
+    if candle_ok and ema_ok and rsi_ok and impulse_ok:
+        return True, (
+            f"M5 SELL confermato: close {close:.2f} < "
+            f"minimo precedente {prev_low:.2f}"
+        )
+
+    missing = []
+    if not candle_ok:
+        missing.append("candela M5 non ribassista")
+    if not ema_ok:
+        missing.append("close M5 sopra EMA50")
+    if not rsi_ok:
+        missing.append(f"RSI M5 {rsi:.1f} fuori range")
+    if not impulse_ok:
+        missing.append(f"serve close M5 < {prev_low:.2f}")
+    return False, ", ".join(missing)
+
+
+def calculate_trend_pullback_stop_distance(
+    direction: str,
+    entry: float,
+    m15: dict,
+    m5: dict,
+) -> float:
+    """
+    Stop tecnico del pullback:
+    - ATR M5
+    - quota minima di ATR M15
+    - micro-struttura delle ultime ~30 min
+    - distanza percentuale minima
+
+    NON usa la struttura H1, per evitare stop da 4.000-5.000 USD
+    su un rientro che nasce da M5/M15.
+    """
+    m5_atr = float(m5["atr"])
+    m15_atr = float(m15["atr"])
+
+    atr_distance = max(
+        m5_atr * TREND_PULLBACK_M5_STOP_ATR_MULTIPLE,
+        m15_atr * TREND_PULLBACK_M15_STOP_ATR_MULTIPLE,
+    )
+
+    min_percent_distance = (
+        entry * TREND_PULLBACK_MIN_STOP_PERCENT / 100
+    )
+
+    if direction == "BUY":
+        structure_stop = (
+            float(m5["micro_previous_low"])
+            - m5_atr * TREND_PULLBACK_STRUCTURE_BUFFER_ATR
+        )
+        structure_distance = max(entry - structure_stop, 0.0)
+    else:
+        structure_stop = (
+            float(m5["micro_previous_high"])
+            + m5_atr * TREND_PULLBACK_STRUCTURE_BUFFER_ATR
+        )
+        structure_distance = max(structure_stop - entry, 0.0)
+
+    return max(
+        atr_distance,
+        min_percent_distance,
+        structure_distance,
+    )
+
+
+def trend_pullback_stop_ok(
+    entry: float,
+    stop_distance: float,
+) -> tuple[bool, str]:
+    percent_cap = entry * TREND_PULLBACK_MAX_STOP_PERCENT / 100
+    max_allowed = min(
+        TREND_PULLBACK_MAX_STOP_USD,
+        percent_cap,
+    )
+
+    if stop_distance <= max_allowed:
+        return (
+            True,
+            f"stop pullback valido: {stop_distance:.2f} USD "
+            f"(max {max_allowed:.2f})",
+        )
+
+    return (
+        False,
+        f"stop pullback ancora troppo largo: {stop_distance:.2f} USD "
+        f"(max {max_allowed:.2f}) - attendere nuova struttura",
+    )
+
+
+def build_trend_pullback_plan(
+    direction: str,
+    m15: dict,
+    m5: dict,
+) -> dict[str, float | str | bool]:
+    broker = active_broker_profile()
+    entry = float(m5["price"])
+
+    stop_distance = calculate_trend_pullback_stop_distance(
+        direction,
+        entry,
+        m15,
+        m5,
+    )
+    stop_valid, stop_reason = trend_pullback_stop_ok(
+        entry,
+        stop_distance,
+    )
+
+    if direction == "BUY":
+        stop_loss = entry - stop_distance
+        tp1 = entry + stop_distance * TREND_PULLBACK_TP1_R
+        tp2 = entry + stop_distance * TREND_PULLBACK_TP2_R
+    else:
+        stop_loss = entry + stop_distance
+        tp1 = entry - stop_distance * TREND_PULLBACK_TP1_R
+        tp2 = entry - stop_distance * TREND_PULLBACK_TP2_R
+
+    broker_capital = float(broker["capital_eur"])
+    target_risk_eur = broker_capital * FULL_RISK_PERCENT / 100
+
+    raw_lot_size = 0.0
+    if stop_distance > 0:
+        raw_lot_size = target_risk_eur / (
+            stop_distance * EUR_PER_USD_MOVE_PER_LOT
+        )
+
+    lot_size = floor_to_step(
+        raw_lot_size,
+        float(broker["lot_step"]),
+    )
+    lot_size = min(
+        lot_size,
+        float(broker["max_lot"]),
+    )
+
+    minimum_warning = False
+    if 0 < raw_lot_size < float(broker["min_lot"]):
+        lot_size = float(broker["min_lot"])
+        minimum_warning = True
+
+    actual_risk_eur = (
+        stop_distance
+        * lot_size
+        * EUR_PER_USD_MOVE_PER_LOT
+    )
+
+    estimated_margin_eur = estimate_margin_eur(
+        entry,
+        lot_size,
+        broker,
+    )
+    margin_executable, remaining_after_margin = is_trade_executable(
+        estimated_margin_eur,
+        broker,
+    )
+
+    max_real_risk_eur = (
+        broker_capital * MAX_REAL_RISK_PERCENT / 100
+    )
+    risk_executable = (
+        actual_risk_eur <= max_real_risk_eur
+        if lot_size > 0
+        else True
+    )
+
+    executable = (
+        stop_valid
+        and margin_executable
+        and risk_executable
+        and lot_size > 0
+    )
+
+    return {
+        "broker_name": str(broker["name"]),
+        "broker_mode": str(broker["mode"]),
+        "broker_capital_eur": broker_capital,
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "stop_distance": stop_distance,
+        "tp1": tp1,
+        "tp2": tp2,
+        "lot_size": lot_size,
+        "size_label": "Pullback M5/M15 - rischio controllato",
+        "target_risk_eur": target_risk_eur,
+        "actual_risk_eur": actual_risk_eur,
+        "tp1_profit_eur": actual_risk_eur * TREND_PULLBACK_TP1_R,
+        "tp2_profit_eur": actual_risk_eur * TREND_PULLBACK_TP2_R,
+        "estimated_margin_eur": estimated_margin_eur,
+        "remaining_after_margin_eur": remaining_after_margin,
+        "trade_executable": executable,
+        "margin_executable": margin_executable,
+        "risk_executable": risk_executable,
+        "max_real_risk_eur": max_real_risk_eur,
+        "raw_lot_size": raw_lot_size,
+        "lot_cap": float(broker["max_lot"]),
+        "minimum_warning": minimum_warning,
+        "plan_mode": "PULLBACK",
+        "pullback_stop_valid": stop_valid,
+        "pullback_stop_reason": stop_reason,
+    }
+
+
+def evaluate_trend_pullback(
+    direction: str,
+    score: int,
+    quality: int,
+    h4: dict,
+    h1: dict,
+    m15: dict,
+    m5: dict,
+) -> tuple[bool, str, dict | None]:
+    context_ok, context_reason = trend_pullback_context_ok(
+        direction,
+        score,
+        quality,
+        h4,
+        h1,
+        m15,
+    )
+    if not context_ok:
+        return False, context_reason, None
+
+    trigger_ok, trigger_reason = trend_pullback_m5_trigger_ok(
+        direction,
+        m5,
+    )
+    if not trigger_ok:
+        return (
+            False,
+            f"contesto forte, attendere trigger pullback M5: {trigger_reason}",
+            None,
+        )
+
+    plan = build_trend_pullback_plan(
+        direction,
+        m15,
+        m5,
+    )
+
+    if not bool(plan["pullback_stop_valid"]):
+        return (
+            False,
+            str(plan["pullback_stop_reason"]),
+            plan,
+        )
+
+    if not bool(plan["risk_executable"]):
+        return (
+            False,
+            f"pullback trovato ma rischio {float(plan['actual_risk_eur']):.2f} EUR "
+            f"> max {float(plan['max_real_risk_eur']):.2f} EUR",
+            plan,
+        )
+
+    if not bool(plan["margin_executable"]):
+        return (
+            False,
+            "pullback valido ma margine insufficiente",
+            plan,
+        )
+
+    return (
+        True,
+        f"TREND MOMENTUM PULLBACK {direction} CONFERMATO - {trigger_reason}",
+        plan,
+    )
+
+
 # =========================
 # SIZE, SL, TP E MARGINE TREND
 # =========================
@@ -1169,6 +1585,7 @@ def build_trade_plan(
         "raw_lot_size": raw_lot_size,
         "lot_cap": lot_cap,
         "minimum_warning": minimum_warning,
+        "plan_mode": "STANDARD",
     }
 
 
@@ -1213,12 +1630,13 @@ def build_telegram_message(
 
     broker_name = str(plan["broker_name"])
     executable = bool(plan["trade_executable"])
+    plan_mode = str(plan.get("plan_mode", "STANDARD"))
     margin_available_text = "SI" if bool(plan.get("margin_executable", executable)) else "NO"
     risk_available_text = "SI" if bool(plan.get("risk_executable", executable)) else "NO"
 
     if state == "ROSSO":
         return (
-            "[NO TRADE - TREND] BTC Trend AI v0.9.9\n\n"
+            "[NO TRADE - TREND] BTC Trend AI v0.9.10\n\n"
             "NESSUN SETUP OPERATIVO\n\n"
             f"Broker operativo: {broker_name}\n"
             f"Trend di fondo H4/H1: {trend_background}\n"
@@ -1260,7 +1678,7 @@ def build_telegram_message(
 
     if state == "GIALLO":
         return (
-            "[PREALLERTA - TREND] BTC Trend AI v0.9.9\n\n"
+            "[PREALLERTA - TREND] BTC Trend AI v0.9.10\n\n"
             f"{setup_label(state, score, quality)}\n\n"
             "STATO: PREALLERTA - NON ENTRARE\n\n"
             f"Broker operativo: {broker_name}\n"
@@ -1269,7 +1687,8 @@ def build_telegram_message(
             f"Margine disponibile per {lot_size:.2f} lotti: "
             f"{margin_available_text}\n"
             f"Rischio entro limite {MAX_REAL_RISK_PERCENT:.2f}%: "
-            f"{risk_available_text}\n\n"
+            f"{risk_available_text}\n"
+            f"Modalita' piano: {plan_mode}\n\n"
             f"Trend di fondo H4/H1: {trend_background}\n"
             f"Momentum M15: {momentum}\n"
             f"Fase mercato: {phase}\n\n"
@@ -1297,7 +1716,7 @@ def build_telegram_message(
     )
 
     return (
-        "[SETUP CONFERMATO - TREND] BTC Trend AI v0.9.9\n\n"
+        "[SETUP CONFERMATO - TREND] BTC Trend AI v0.9.10\n\n"
         f"{setup_label(state, score, quality)}\n"
         f"{authorization}\n\n"
         f"Broker operativo: {broker_name}\n"
@@ -1306,7 +1725,8 @@ def build_telegram_message(
         f"Operazione eseguibile: {'SI' if executable else 'NO'}\n"
         f"Margine sufficiente: {margin_available_text}\n"
         f"Rischio entro limite {MAX_REAL_RISK_PERCENT:.2f}%: "
-        f"{risk_available_text}\n\n"
+        f"{risk_available_text}\n"
+        f"Modalita' piano: {plan_mode}\n\n"
         f"Trend di fondo H4/H1: {trend_background}\n"
         f"Momentum M15: {momentum}\n"
         f"Fase mercato: {phase}\n\n"
@@ -1350,7 +1770,7 @@ def build_active_setup_message(
     if current_price is not None:
         price_line = f"Prezzo attuale: {current_price:.2f}\n"
     return (
-        f"{title} BTC Trend AI v0.9.9\n\n"
+        f"{title} BTC Trend AI v0.9.10\n\n"
         f"{setup['direction']} - POSIZIONE IN MONITORAGGIO\n"
         f"Broker: {setup.get('broker_name', 'N/D')}\n\n"
         f"Entrata originale: {float(setup['entry']):.2f}\n"
@@ -1620,7 +2040,7 @@ def build_scalp_management_message(
     action: str,
 ) -> str:
     return (
-        f"{title} BTC Trend AI v0.9.9\n\n"
+        f"{title} BTC Trend AI v0.9.10\n\n"
         f"SCALP {setup['direction']} - POSIZIONE IN MONITORAGGIO\n"
         f"Broker: {setup['broker_name']}\n\n"
         f"Entrata: {float(setup['entry']):.2f}\n"
@@ -1779,7 +2199,7 @@ def manage_active_scalp_setup(
 
 
 # =========================
-# MOTORE SCALP v0.9.9
+# MOTORE SCALP v0.9.10
 # =========================
 
 def scalp_direction_score(
@@ -2229,7 +2649,7 @@ def build_scalp_green_message(
     )
 
     return (
-        f"[{direction} SCALP - INGRESSO] BTC Trend AI v0.9.9\n\n"
+        f"[{direction} SCALP - INGRESSO] BTC Trend AI v0.9.10\n\n"
         f"SCALP {direction} - INGRESSO CONFERMATO\n"
         "Durata obiettivo: 15-60 minuti\n\n"
         f"Broker operativo: {plan['broker_name']}\n"
@@ -2327,7 +2747,7 @@ async def evaluate_and_notify_scalp(
     )
 
     print(
-        "\nSCALP v0.9.9 | "
+        "\nSCALP v0.9.10 | "
         f"{direction} score={score}/100 quality={quality}/100 "
         f"trigger={'SI' if trigger else 'NO'} "
         f"H1_block={'SI' if blocked else 'NO'} "
@@ -2512,7 +2932,7 @@ async def run_analysis(
 
     print(
         "\n"
-        f"{now} DEBUG v0.9.9 TREND\n"
+        f"{now} DEBUG v0.9.10 TREND\n"
         f"Direzione: {direction}\n"
         f"Score: {score}/100 "
         f"(H4={score_parts.get('H4', 0)}, "
@@ -2531,7 +2951,10 @@ async def run_analysis(
         f"Trend fondo={trend_label_from_higher_timeframes(h4, h1)} | "
         f"Momentum M15={m15_momentum_label(m15)} | "
         f"Fase={market_phase_label(direction, h4, h1, m15)}\n"
-        f"Motivi: {', '.join(reasons)}",
+        f"Motivi: {', '.join(reasons)}\n"
+        f"Pullback v0.9.10: "
+        f"{'VERDE' if pullback_green else 'ATTESA'} | "
+        f"{pullback_reason}",
         flush=True,
     )
 
@@ -2568,21 +2991,58 @@ async def run_analysis(
 
         return
 
-    state, action = determine_state(
+    # ---------------------------------------------------------
+    # v0.9.10 - PRIORITA' TREND MOMENTUM PULLBACK
+    # ---------------------------------------------------------
+    pullback_green, pullback_reason, pullback_plan = evaluate_trend_pullback(
         direction,
         score,
         quality,
         h4,
         h1,
         m15,
+        m5,
     )
 
-    plan = build_trade_plan(
-        direction,
-        state,
-        m15,
-        h1,
-    )
+    if pullback_green and pullback_plan is not None:
+        state = "VERDE"
+        action = pullback_reason
+        plan = pullback_plan
+    else:
+        state, action = determine_state(
+            direction,
+            score,
+            quality,
+            h4,
+            h1,
+            m15,
+        )
+
+        plan = build_trade_plan(
+            direction,
+            state,
+            m15,
+            h1,
+        )
+
+        # Se il trend e' forte ma il piano standard ha rischio troppo alto,
+        # il messaggio deve spiegare che si sta aspettando un rientro M5/M15.
+        strong_context = (
+            score >= TREND_PULLBACK_MIN_SCORE
+            and quality >= TREND_PULLBACK_MIN_QUALITY
+            and higher_timeframes_aligned(direction, h4, h1)
+        )
+
+        if (
+            strong_context
+            and not bool(plan["risk_executable"])
+            and not pullback_green
+        ):
+            state = "GIALLO"
+            action = (
+                "TREND FORTE - PIANO STANDARD TROPPO LARGO. "
+                f"ATTENDERE PULLBACK M5/M15: {pullback_reason}"
+            )
 
     message = build_telegram_message(
         state,
@@ -2607,7 +3067,8 @@ async def run_analysis(
         f"{m15_momentum_label(m15)}|"
         f"{market_phase_label(direction, h4, h1, m15)}|"
         f"{score_band(score)}|"
-        f"{quality_band(quality)}"
+        f"{quality_band(quality)}|"
+        f"{plan.get('plan_mode', 'STANDARD')}"
     )
 
     if (
@@ -2641,7 +3102,7 @@ async def run_analysis(
 
 async def main() -> None:
     print(
-        "BTC Trend AI v0.9.9 DUAL Trend+Scalp Multi-Broker avviato",
+        "BTC Trend AI v0.9.10 DUAL Trend+Scalp Multi-Broker avviato",
         flush=True,
     )
 
@@ -2652,7 +3113,7 @@ async def main() -> None:
         raise RuntimeError("TELEGRAM_CHAT_ID mancante")
 
     headers = {
-        "User-Agent": "BTC-Trend-AI/0.9.9",
+        "User-Agent": "BTC-Trend-AI/0.9.10",
         "Accept": "application/json",
     }
 
