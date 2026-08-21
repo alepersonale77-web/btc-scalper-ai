@@ -9,12 +9,13 @@ from telegram import Bot
 
 
 # ============================================================
-# BTC TREND AI v0.9.8 - DUAL: TREND / SWING + SCALP
+# BTC TREND AI v0.9.9 - DUAL: TREND / SWING + SCALP
 # CONFIGURAZIONE FUTURA:
 # - FP Markets capitale predefinito: 475 EUR
 # - rischio reale massimo per singolo setup: 6.25%
-# - nessun calcolo sulle posizioni manuali gia' aperte
-# MODIFICA v0.9.8:
+# - nuovi ingressi separati dalla gestione posizioni gia' aperte
+# - canale TREND MOMENTUM attivo
+# MODIFICA v0.9.9:
 # - TREND: canale anticipato anche con score 85-87 se qualita' >= 90
 # - TREND: setup eccezionale 88+ resta prioritario
 # - TREND/SCALP: blocco se il rischio reale della size minima e' eccessivo
@@ -66,12 +67,24 @@ EARLY_ENTRY_MAX_M15_EXTENSION_ATR = float(
     os.environ.get("EARLY_ENTRY_MAX_M15_EXTENSION_ATR", "0.90")
 )
 
+# Canale TREND MOMENTUM v0.9.9
+MOMENTUM_MIN_SCORE = int(os.environ.get("MOMENTUM_MIN_SCORE", "82"))
+MOMENTUM_MIN_QUALITY = int(os.environ.get("MOMENTUM_MIN_QUALITY", "90"))
+MOMENTUM_MIN_H1_ADX = float(os.environ.get("MOMENTUM_MIN_H1_ADX", "24"))
+MOMENTUM_MIN_M15_ADX = float(os.environ.get("MOMENTUM_MIN_M15_ADX", "18"))
+MOMENTUM_MAX_M15_EXTENSION_ATR = float(
+    os.environ.get("MOMENTUM_MAX_M15_EXTENSION_ATR", "1.35")
+)
+MOMENTUM_PULLBACK_MAX_EXTENSION_ATR = float(
+    os.environ.get("MOMENTUM_PULLBACK_MAX_EXTENSION_ATR", "0.75")
+)
+
 MAX_REAL_RISK_PERCENT = float(
     os.environ.get("MAX_REAL_RISK_PERCENT", "6.25")
 )
 
 # =========================
-# MODALITA' SCALP v0.9.8
+# MODALITA' SCALP v0.9.9
 # =========================
 SCALP_ENABLED = os.environ.get("SCALP_ENABLED", "1") == "1"
 SCALP_GREEN_MIN_SCORE = int(os.environ.get("SCALP_GREEN_MIN_SCORE", "78"))
@@ -887,6 +900,8 @@ def determine_state(
     aligned = higher_timeframes_aligned(direction, h4, h1)
     trigger_ok = m15_trigger_ok(direction, m15)
     extension = float(m15["distance_from_ema50_atr"])
+    h1_adx = float(h1["adx"])
+    m15_adx = float(m15["adx"])
 
     exceptional_candidate = (
         score >= EXCEPTIONAL_MIN_SCORE
@@ -894,25 +909,29 @@ def determine_state(
         and aligned
         and trigger_ok
     )
-
     if exceptional_candidate:
         if extension <= EXCEPTIONAL_MAX_M15_EXTENSION_ATR:
-            global green_candidate_direction
-            global green_candidate_count
-            global green_candidate_last_m15_time
+            global green_candidate_direction, green_candidate_count, green_candidate_last_m15_time
             green_candidate_direction = None
             green_candidate_count = 0
             green_candidate_last_m15_time = int(m15["last_candle_time"])
+            return "VERDE", "SETUP ECCEZIONALE - VALUTA INGRESSO ANTICIPATO"
+        return "GIALLO", "SETUP ECCEZIONALE MA PREZZO ESTESO - ATTENDERE PULLBACK"
 
-            return (
-                "VERDE",
-                "SETUP ECCEZIONALE - VALUTA INGRESSO ANTICIPATO",
-            )
-
-        return (
-            "GIALLO",
-            "SETUP ECCEZIONALE MA PREZZO ESTESO - ATTENDERE PULLBACK",
-        )
+    momentum_candidate = (
+        score >= MOMENTUM_MIN_SCORE
+        and quality >= MOMENTUM_MIN_QUALITY
+        and aligned
+        and h1_adx >= MOMENTUM_MIN_H1_ADX
+        and m15_adx >= MOMENTUM_MIN_M15_ADX
+        and str(m15["trend"]) == ("RIALZISTA" if direction == "BUY" else "RIBASSISTA")
+    )
+    if momentum_candidate:
+        if extension <= MOMENTUM_PULLBACK_MAX_EXTENSION_ATR:
+            return "VERDE", "TREND MOMENTUM - PULLBACK FAVOREVOLE, VALUTA INGRESSO"
+        if extension <= MOMENTUM_MAX_M15_EXTENSION_ATR:
+            return "VERDE", "TREND MOMENTUM - VALUTA INGRESSO SENZA INSEGUIRE"
+        return "GIALLO", "TREND MOMENTUM FORTE MA PREZZO TROPPO ESTESO - ATTENDERE PULLBACK"
 
     early_candidate = (
         EARLY_ENTRY_MIN_SCORE <= score <= EARLY_ENTRY_MAX_SCORE
@@ -920,22 +939,13 @@ def determine_state(
         and aligned
         and trigger_ok
     )
-
     if early_candidate:
         if extension <= EARLY_ENTRY_MAX_M15_EXTENSION_ATR:
             green_candidate_direction = None
             green_candidate_count = 0
             green_candidate_last_m15_time = int(m15["last_candle_time"])
-
-            return (
-                "VERDE",
-                "SETUP FORTE - INGRESSO ANTICIPATO CON RISCHIO CONTROLLATO",
-            )
-
-        return (
-            "GIALLO",
-            "SETUP FORTE MA PREZZO ESTESO - ATTENDERE PULLBACK",
-        )
+            return "VERDE", "SETUP FORTE - INGRESSO ANTICIPATO CON RISCHIO CONTROLLATO"
+        return "GIALLO", "SETUP FORTE MA PREZZO ESTESO - ATTENDERE PULLBACK"
 
     green_candidate = (
         score >= GREEN_MIN_SCORE
@@ -943,47 +953,21 @@ def determine_state(
         and aligned
         and trigger_ok
     )
-
-    green_confirmed, confirm_count = apply_green_persistence(
-        direction,
-        green_candidate,
-        m15,
-    )
-
+    green_confirmed, confirm_count = apply_green_persistence(direction, green_candidate, m15)
     if green_confirmed:
         return "VERDE", "SETUP CONFERMATO - VALUTA L'INGRESSO"
-
     if green_candidate:
-        return (
-            "GIALLO",
-            f"CONFERMA {confirm_count}/{GREEN_CONFIRM_BARS} - ATTENDERE",
-        )
+        return "GIALLO", f"CONFERMA {confirm_count}/{GREEN_CONFIRM_BARS} - ATTENDERE"
 
-    too_extended = extension > 1.20
-
-    if (
-        score >= YELLOW_MIN_SCORE
-        and quality >= YELLOW_MIN_QUALITY
-    ):
-        if too_extended:
+    if score >= YELLOW_MIN_SCORE and quality >= YELLOW_MIN_QUALITY:
+        if extension > 1.20:
             return "GIALLO", "NON INSEGUIRE IL PREZZO"
-
         if not aligned:
-            return (
-                "GIALLO",
-                "PREALLERTA - H4/H1 NON ANCORA COMPLETI",
-            )
-
+            return "GIALLO", "PREALLERTA - H4/H1 NON ANCORA COMPLETI"
         if not trigger_ok:
-            return (
-                "GIALLO",
-                "PREALLERTA - ATTENDERE TRIGGER M15",
-            )
-
+            return "GIALLO", "PREALLERTA - ATTENDERE TRIGGER M15"
         return "GIALLO", "PREALLERTA - POSSIBILE INGRESSO"
-
     return "ROSSO", "NON ENTRARE"
-
 
 def trend_label_from_higher_timeframes(
     h4: dict,
@@ -1234,7 +1218,7 @@ def build_telegram_message(
 
     if state == "ROSSO":
         return (
-            "[NO TRADE - TREND] BTC Trend AI v0.9.8\n\n"
+            "[NO TRADE - TREND] BTC Trend AI v0.9.9\n\n"
             "NESSUN SETUP OPERATIVO\n\n"
             f"Broker operativo: {broker_name}\n"
             f"Trend di fondo H4/H1: {trend_background}\n"
@@ -1276,7 +1260,7 @@ def build_telegram_message(
 
     if state == "GIALLO":
         return (
-            "[PREALLERTA - TREND] BTC Trend AI v0.9.8\n\n"
+            "[PREALLERTA - TREND] BTC Trend AI v0.9.9\n\n"
             f"{setup_label(state, score, quality)}\n\n"
             "STATO: PREALLERTA - NON ENTRARE\n\n"
             f"Broker operativo: {broker_name}\n"
@@ -1301,9 +1285,9 @@ def build_telegram_message(
             f"{float(plan['estimated_margin_eur']):.2f} EUR\n\n"
             f"Affidabilita' tecnica: {score}/100\n"
             f"Qualita' mercato: {quality}/100\n\n"
-            "AZIONE: ATTENDERE IL VERDE CONFERMATO\n"
+            "AZIONE NUOVO INGRESSO: ATTENDERE IL VERDE CONFERMATO\n"
             f"{warning}"
-            "Questa e' solo una preallerta: non aprire il trade."
+            "Questa e' solo una preallerta: non aprire un nuovo trade. Se hai gia' una posizione, gestiscila separatamente."
         )
 
     authorization = (
@@ -1313,7 +1297,7 @@ def build_telegram_message(
     )
 
     return (
-        "[SETUP CONFERMATO - TREND] BTC Trend AI v0.9.8\n\n"
+        "[SETUP CONFERMATO - TREND] BTC Trend AI v0.9.9\n\n"
         f"{setup_label(state, score, quality)}\n"
         f"{authorization}\n\n"
         f"Broker operativo: {broker_name}\n"
@@ -1347,7 +1331,7 @@ def build_telegram_message(
         f"Affidabilita' tecnica: {score}/100\n"
         f"Qualita' mercato: {quality}/100\n"
         f"Durata stimata: {duration_estimate(state)}\n\n"
-        f"AZIONE CONSIGLIATA: {action}\n"
+        f"AZIONE NUOVO INGRESSO: {action}\n"
         f"{warning}"
         "Il VERDE e' il solo stato che autorizza la valutazione "
         "di un nuovo ingresso."
@@ -1366,7 +1350,7 @@ def build_active_setup_message(
     if current_price is not None:
         price_line = f"Prezzo attuale: {current_price:.2f}\n"
     return (
-        f"{title} BTC Trend AI v0.9.8\n\n"
+        f"{title} BTC Trend AI v0.9.9\n\n"
         f"{setup['direction']} - POSIZIONE IN MONITORAGGIO\n"
         f"Broker: {setup.get('broker_name', 'N/D')}\n\n"
         f"Entrata originale: {float(setup['entry']):.2f}\n"
@@ -1636,7 +1620,7 @@ def build_scalp_management_message(
     action: str,
 ) -> str:
     return (
-        f"{title} BTC Trend AI v0.9.8\n\n"
+        f"{title} BTC Trend AI v0.9.9\n\n"
         f"SCALP {setup['direction']} - POSIZIONE IN MONITORAGGIO\n"
         f"Broker: {setup['broker_name']}\n\n"
         f"Entrata: {float(setup['entry']):.2f}\n"
@@ -1795,7 +1779,7 @@ def manage_active_scalp_setup(
 
 
 # =========================
-# MOTORE SCALP v0.9.8
+# MOTORE SCALP v0.9.9
 # =========================
 
 def scalp_direction_score(
@@ -2245,7 +2229,7 @@ def build_scalp_green_message(
     )
 
     return (
-        f"[{direction} SCALP - INGRESSO] BTC Trend AI v0.9.8\n\n"
+        f"[{direction} SCALP - INGRESSO] BTC Trend AI v0.9.9\n\n"
         f"SCALP {direction} - INGRESSO CONFERMATO\n"
         "Durata obiettivo: 15-60 minuti\n\n"
         f"Broker operativo: {plan['broker_name']}\n"
@@ -2343,7 +2327,7 @@ async def evaluate_and_notify_scalp(
     )
 
     print(
-        "\nSCALP v0.9.8 | "
+        "\nSCALP v0.9.9 | "
         f"{direction} score={score}/100 quality={quality}/100 "
         f"trigger={'SI' if trigger else 'NO'} "
         f"H1_block={'SI' if blocked else 'NO'} "
@@ -2528,7 +2512,7 @@ async def run_analysis(
 
     print(
         "\n"
-        f"{now} DEBUG v0.9.8 TREND\n"
+        f"{now} DEBUG v0.9.9 TREND\n"
         f"Direzione: {direction}\n"
         f"Score: {score}/100 "
         f"(H4={score_parts.get('H4', 0)}, "
@@ -2657,7 +2641,7 @@ async def run_analysis(
 
 async def main() -> None:
     print(
-        "BTC Trend AI v0.9.8 DUAL Trend+Scalp Multi-Broker avviato",
+        "BTC Trend AI v0.9.9 DUAL Trend+Scalp Multi-Broker avviato",
         flush=True,
     )
 
@@ -2668,7 +2652,7 @@ async def main() -> None:
         raise RuntimeError("TELEGRAM_CHAT_ID mancante")
 
     headers = {
-        "User-Agent": "BTC-Trend-AI/0.9.8",
+        "User-Agent": "BTC-Trend-AI/0.9.9",
         "Accept": "application/json",
     }
 
